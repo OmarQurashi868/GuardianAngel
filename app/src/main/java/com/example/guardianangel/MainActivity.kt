@@ -74,7 +74,8 @@ import kotlin.concurrent.thread
 class MainActivity : ComponentActivity() {
     private val currentScreen = mutableStateOf<Screen>(Screen.Main)
     private val discoveredDevices = mutableStateListOf<NsdServiceInfo>()
-    private val connectedGuardians = mutableStateListOf<String>()
+    private val connectedGuardians = mutableStateListOf<GuardianConnection>()
+    private val connectedWardName = mutableStateOf<String?>(null)
     private var nsdManager: NsdManager? = null
     private var discoveryListener: NsdManager.DiscoveryListener? = null
     private var serverSocket: ServerSocket? = null
@@ -84,6 +85,8 @@ class MainActivity : ComponentActivity() {
     private val localIpAddress = mutableStateOf("")
     private var foregroundService: ForegroundService? = null
     private var serviceBound = false
+    private var clientSockets = mutableListOf<Socket>()
+    val streamVolume = mutableStateOf(0.5f)
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -119,7 +122,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             GuardianAngelTheme {
-                when (currentScreen.value) {
+                when (val screen = currentScreen.value) {
                     Screen.Main -> MainScreen(
                         onGuardianClick = { currentScreen.value = Screen.Guardian },
                         onWardClick = { currentScreen.value = Screen.Ward }
@@ -134,10 +137,24 @@ class MainActivity : ComponentActivity() {
                             stopAudioPlayback()
                             stopForegroundService()
                         },
-                        onManualConnect = { ip -> connectToWardByIp(ip) }
+                        onManualConnect = { ip -> connectToWardByIp(ip, null) },
+                        onDeviceConnect = { deviceName -> connectToWard(deviceName) }
+                    )
+                    is Screen.GuardianConnected -> GuardianConnectedScreen(
+                        wardName = screen.wardName,
+                        volume = streamVolume.value,
+                        onVolumeChange = { newVolume ->
+                            streamVolume.value = newVolume
+                            audioTrack?.setVolume(newVolume)
+                        },
+                        onBack = {
+                            currentScreen.value = Screen.Main
+                            stopAudioPlayback()
+                            stopForegroundService()
+                        }
                     )
                     Screen.Ward -> WardScreen(
-                        connectedGuardians = connectedGuardians,
+                        connectedGuardians = connectedGuardians.map { it.deviceName },
                         localIp = localIpAddress.value,
                         onBack = {
                             currentScreen.value = Screen.Main
@@ -261,11 +278,52 @@ class MainActivity : ComponentActivity() {
                 // Wait for Guardian to connect
                 while (serverSocket != null && !serverSocket!!.isClosed) {
                     val client = serverSocket?.accept()
-                    client?.let {
-                        val guardianIp = it.inetAddress.hostAddress ?: "Unknown"
+                    client?.let { socket ->
+                        val guardianIp = socket.inetAddress.hostAddress ?: "Unknown"
                         Log.d(TAG, "Guardian connected from $guardianIp")
-                        connectedGuardians.add(guardianIp)
-                        startAudioCapture(it.getOutputStream())
+                        
+                        // Read device name from guardian
+                        thread {
+                            try {
+                                val inputStream = socket.getInputStream()
+                                val nameBytes = ByteArray(256)
+                                val nameLength = inputStream.read(nameBytes)
+                                val guardianName = if (nameLength > 0) {
+                                    String(nameBytes, 0, nameLength).trim()
+                                } else {
+                                    guardianIp
+                                }
+                                
+                                val connection = GuardianConnection(guardianName, guardianIp, socket)
+                                connectedGuardians.add(connection)
+                                clientSockets.add(socket)
+                                
+                                // Monitor connection
+                                thread {
+                                    try {
+                                        while (!socket.isClosed && socket.isConnected) {
+                                            Thread.sleep(1000)
+                                        }
+                                    } catch (e: Exception) {
+                                        Log.d(TAG, "Connection monitoring ended: ${e.message}")
+                                    } finally {
+                                        runOnUiThread {
+                                            connectedGuardians.removeAll { it.socket == socket }
+                                            clientSockets.remove(socket)
+                                        }
+                                        Log.d(TAG, "Guardian $guardianName disconnected")
+                                    }
+                                }
+                                
+                                startAudioCapture(socket.getOutputStream())
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Error handling guardian connection: ${e.message}")
+                                runOnUiThread {
+                                    connectedGuardians.removeAll { it.socket == socket }
+                                    clientSockets.remove(socket)
+                                }
+                            }
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -325,8 +383,15 @@ class MainActivity : ComponentActivity() {
         audioRecord?.stop()
         audioRecord?.release()
         audioRecord = null
+        
+        clientSockets.forEach { 
+            try { it.close() } catch (e: Exception) { }
+        }
+        clientSockets.clear()
+        
         serverSocket?.close()
         serverSocket = null
+        connectedGuardians.clear()
     }
     
     internal fun startDiscovery() {
@@ -334,65 +399,105 @@ class MainActivity : ComponentActivity() {
         discoveryListener = object : NsdManager.DiscoveryListener {
             override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
                 Log.e(TAG, "Discovery start failed: $errorCode")
+                runOnUiThread {
+                    // Retry discovery after a delay
+                    thread {
+                        Thread.sleep(2000)
+                        runOnUiThread {
+                            if (currentScreen.value == Screen.Guardian) {
+                                startDiscovery()
+                            }
+                        }
+                    }
+                }
             }
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
                 Log.e(TAG, "Discovery stop failed: $errorCode")
             }
             override fun onDiscoveryStarted(serviceType: String) {
-                Log.d(TAG, "Discovery started")
+                Log.d(TAG, "Discovery started for $serviceType")
             }
             override fun onDiscoveryStopped(serviceType: String) {
                 Log.d(TAG, "Discovery stopped")
             }
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
                 Log.d(TAG, "Service found: ${serviceInfo.serviceName}")
-                nsdManager?.resolveService(serviceInfo, object : NsdManager.ResolveListener {
-                    override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                        Log.e(TAG, "Resolve failed: $errorCode")
+                // Resolve on a separate thread to avoid blocking
+                thread {
+                    try {
+                        nsdManager?.resolveService(serviceInfo, object : NsdManager.ResolveListener {
+                            override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                                Log.e(TAG, "Resolve failed for ${serviceInfo.serviceName}: $errorCode")
+                            }
+                            override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
+                                Log.d(TAG, "Service resolved: ${serviceInfo.serviceName} at ${serviceInfo.host}:${serviceInfo.port}")
+                                runOnUiThread {
+                                    if (!discoveredDevices.any { it.serviceName == serviceInfo.serviceName }) {
+                                        discoveredDevices.add(serviceInfo)
+                                    }
+                                }
+                            }
+                        })
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error resolving service: ${e.message}")
                     }
-                    override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
-                        Log.d(TAG, "Service resolved: ${serviceInfo.serviceName} at ${serviceInfo.host}:${serviceInfo.port}")
-                        discoveredDevices.add(serviceInfo)
-                    }
-                })
+                }
             }
             override fun onServiceLost(serviceInfo: NsdServiceInfo) {
-                discoveredDevices.removeAll { it.serviceName == serviceInfo.serviceName }
+                Log.d(TAG, "Service lost: ${serviceInfo.serviceName}")
+                runOnUiThread {
+                    discoveredDevices.removeAll { it.serviceName == serviceInfo.serviceName }
+                }
             }
         }
-        nsdManager?.discoverServices("_ward._tcp", NsdManager.PROTOCOL_DNS_SD, discoveryListener)
+        
+        try {
+            nsdManager?.discoverServices("_ward._tcp", NsdManager.PROTOCOL_DNS_SD, discoveryListener)
+            Log.d(TAG, "Started discovering services")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting discovery: ${e.message}")
+        }
     }
 
     internal fun connectToWard(deviceName: String) {
         val serviceInfo = discoveredDevices.find { it.serviceName == deviceName }
         serviceInfo?.let {
-            startForegroundService("Guardian Active", "Connected to ward")
-            thread {
-                try {
-                    val socket = Socket(it.host, it.port)
-                    Log.d(TAG, "Connected to ward at ${it.host}:${it.port}")
-                    startAudioPlayback(socket.getInputStream())
-                } catch (e: Exception) {
-                    Log.e(TAG, "Connection error: ${e.message}")
+            val wardName = it.serviceName.removePrefix("ward_")
+            connectToWardByIp(it.host.hostAddress ?: "", wardName)
+        }
+    }
+
+    internal fun connectToWardByIp(ipAddress: String, wardName: String?) {
+        startForegroundService("Guardian Active", "Connecting to ward...")
+        stopDiscovery()
+        
+        thread {
+            try {
+                val socket = Socket(ipAddress, AUDIO_PORT)
+                Log.d(TAG, "Connected to ward at $ipAddress:$AUDIO_PORT")
+                
+                // Send device name to ward
+                val deviceName = Build.MODEL
+                socket.getOutputStream().write(deviceName.toByteArray())
+                socket.getOutputStream().flush()
+                
+                val displayName = wardName ?: ipAddress
+                runOnUiThread {
+                    connectedWardName.value = displayName
+                    currentScreen.value = Screen.GuardianConnected(displayName)
+                }
+                
+                startAudioPlayback(socket.getInputStream(), socket)
+            } catch (e: Exception) {
+                Log.e(TAG, "Connection error: ${e.message}")
+                runOnUiThread {
+                    stopForegroundService()
                 }
             }
         }
     }
 
-    internal fun connectToWardByIp(ipAddress: String) {
-        startForegroundService("Guardian Active", "Connecting to ward...")
-        thread {
-            try {
-                val socket = Socket(ipAddress, AUDIO_PORT)
-                Log.d(TAG, "Connected to ward at $ipAddress:$AUDIO_PORT")
-                startAudioPlayback(socket.getInputStream())
-            } catch (e: Exception) {
-                Log.e(TAG, "Manual connection error: ${e.message}")
-            }
-        }
-    }
-
-    private fun startAudioPlayback(inputStream: InputStream) {
+    private fun startAudioPlayback(inputStream: InputStream, socket: Socket) {
         thread {
             try {
                 val bufferSize = AudioTrack.getMinBufferSize(
@@ -410,10 +515,11 @@ class MainActivity : ComponentActivity() {
                     AudioTrack.MODE_STREAM
                 )
 
+                audioTrack?.setStereoVolume(streamVolume.value, streamVolume.value)
                 audioTrack?.play()
                 val buffer = ByteArray(bufferSize)
 
-                while (true) {
+                while (!socket.isClosed && socket.isConnected) {
                     val bytesRead = inputStream.read(buffer)
                     if (bytesRead == -1) break
                     audioTrack?.write(buffer, 0, bytesRead)
@@ -423,7 +529,19 @@ class MainActivity : ComponentActivity() {
             } finally {
                 audioTrack?.stop()
                 audioTrack?.release()
-                inputStream.close()
+                audioTrack = null
+                try {
+                    inputStream.close()
+                    socket.close()
+                } catch (e: Exception) { }
+                
+                runOnUiThread {
+                    if (currentScreen.value is Screen.GuardianConnected) {
+                        currentScreen.value = Screen.Guardian
+                        startDiscovery()
+                    }
+                    stopForegroundService()
+                }
             }
         }
     }
@@ -432,6 +550,7 @@ class MainActivity : ComponentActivity() {
         audioTrack?.stop()
         audioTrack?.release()
         audioTrack = null
+        connectedWardName.value = null
     }
     
     private fun stopDiscovery() {
@@ -458,7 +577,14 @@ sealed class Screen {
     object Main : Screen()
     object Guardian : Screen()
     object Ward : Screen()
+    data class GuardianConnected(val wardName: String) : Screen()
 }
+
+data class GuardianConnection(
+    val deviceName: String,
+    val ipAddress: String,
+    val socket: Socket
+)
 
 @Composable
 fun MainScreen(
@@ -687,7 +813,8 @@ fun WardScreen(
 fun GuardianScreen(
     devices: List<String>,
     onBack: () -> Unit,
-    onManualConnect: (String) -> Unit
+    onManualConnect: (String) -> Unit,
+    onDeviceConnect: (String) -> Unit
 ) {
     val activity = androidx.compose.ui.platform.LocalContext.current as? MainActivity
     val showDialog = remember { mutableStateOf(false) }
@@ -771,7 +898,7 @@ fun GuardianScreen(
                             .fillMaxWidth()
                             .background(Color(0xFF2C2C2C), shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
                             .clickable {
-                                activity?.connectToWard(device)
+                                onDeviceConnect(device)
                             }
                             .padding(16.dp),
                         contentAlignment = Alignment.CenterStart
@@ -868,6 +995,201 @@ fun GuardianScreen(
 
     // Start discovery
     activity?.startDiscovery()
+}
+
+@Composable
+fun GuardianConnectedScreen(
+    wardName: String,
+    volume: Float,
+    onVolumeChange: (Float) -> Unit,
+    onBack: () -> Unit
+) {
+    val showDialog = remember { mutableStateOf(false) }
+
+    BackHandler {
+        showDialog.value = true
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF1A1A1A))
+    ) {
+        // Banner
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(80.dp)
+                .background(Color(0xFF2C5F8D))
+        ) {
+            IconButton(
+                onClick = { showDialog.value = true },
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(start = 8.dp, bottom = 8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = "Back",
+                    tint = Color.White
+                )
+            }
+            Text(
+                text = "GUARDIAN",
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 8.dp),
+                style = TextStyle(
+                    fontSize = 32.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White
+                )
+            )
+        }
+
+        // Content
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(24.dp)
+        ) {
+            // Connected to ward
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF2C5F8D), shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp))
+                    .padding(24.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "Connected to",
+                        style = TextStyle(
+                            fontSize = 16.sp,
+                            color = Color.White.copy(alpha = 0.7f)
+                        )
+                    )
+                    Text(
+                        text = wardName,
+                        style = TextStyle(
+                            fontSize = 28.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
+                    )
+                }
+            }
+
+            // Volume control
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF2C2C2C), shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp))
+                    .padding(24.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = "Audio Volume",
+                    style = TextStyle(
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                    )
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(
+                        text = "\uD83D\uDD08",
+                        style = TextStyle(fontSize = 24.sp)
+                    )
+                    androidx.compose.material3.Slider(
+                        value = volume,
+                        onValueChange = onVolumeChange,
+                        modifier = Modifier.weight(1f),
+                        valueRange = 0f..1f
+                    )
+                    Text(
+                        text = "\uD83D\uDD0A",
+                        style = TextStyle(fontSize = 24.sp)
+                    )
+                }
+                Text(
+                    text = "${(volume * 100).toInt()}%",
+                    style = TextStyle(
+                        fontSize = 24.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                    ),
+                    modifier = Modifier.align(Alignment.CenterHorizontally)
+                )
+            }
+
+            // Status indicator
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF2C2C2C), shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
+                    .padding(16.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .width(12.dp)
+                            .height(12.dp)
+                            .background(Color(0xFF00FF00), shape = androidx.compose.foundation.shape.CircleShape)
+                    )
+                    Text(
+                        text = "Audio streaming active",
+                        style = TextStyle(
+                            fontSize = 16.sp,
+                            color = Color.White
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    // Confirmation Dialog
+    if (showDialog.value) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showDialog.value = false },
+            title = {
+                Text(text = "Disconnect?")
+            },
+            text = {
+                Text(text = "Are you sure you want to disconnect from the ward?")
+            },
+            confirmButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = {
+                        showDialog.value = false
+                        onBack()
+                    }
+                ) {
+                    Text("Yes")
+                }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = { showDialog.value = false }
+                ) {
+                    Text("No")
+                }
+            }
+        )
+    }
 }
 
 // Foreground Service to keep the app running
