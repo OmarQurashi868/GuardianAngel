@@ -1,6 +1,14 @@
 package com.example.guardianangel
 
 import android.Manifest
+import android.app.NotificationManager
+import android.app.Service
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
@@ -8,8 +16,10 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.os.Binder
 import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -19,10 +29,13 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -30,6 +43,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -46,9 +60,13 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.example.guardianangel.ui.theme.GuardianAngelTheme
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.InetAddress
+import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import kotlin.concurrent.thread
@@ -56,12 +74,29 @@ import kotlin.concurrent.thread
 class MainActivity : ComponentActivity() {
     private val currentScreen = mutableStateOf<Screen>(Screen.Main)
     private val discoveredDevices = mutableStateListOf<NsdServiceInfo>()
+    private val connectedGuardians = mutableStateListOf<String>()
     private var nsdManager: NsdManager? = null
     private var discoveryListener: NsdManager.DiscoveryListener? = null
     private var serverSocket: ServerSocket? = null
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
     private var isStreaming = false
+    private val localIpAddress = mutableStateOf("")
+    private var foregroundService: ForegroundService? = null
+    private var serviceBound = false
+
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            val binder = service as? ForegroundService.LocalBinder
+            foregroundService = binder?.getService()
+            serviceBound = true
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            foregroundService = null
+            serviceBound = false
+        }
+    }
 
     companion object {
         private const val TAG = "GuardianAngel"
@@ -70,14 +105,18 @@ class MainActivity : ComponentActivity() {
         private const val CHANNEL_CONFIG_IN = AudioFormat.CHANNEL_IN_MONO
         private const val CHANNEL_CONFIG_OUT = AudioFormat.CHANNEL_OUT_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
+        const val NOTIFICATION_CHANNEL_ID = "guardian_angel_channel"
+        const val NOTIFICATION_ID = 1
     }
     
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        
+
         nsdManager = getSystemService(NSD_SERVICE) as NsdManager
-    
+        createNotificationChannel()
+        localIpAddress.value = getLocalIpAddress()
+
         setContent {
             GuardianAngelTheme {
                 when (currentScreen.value) {
@@ -86,26 +125,114 @@ class MainActivity : ComponentActivity() {
                         onWardClick = { currentScreen.value = Screen.Ward }
                     )
                     Screen.Guardian -> GuardianScreen(
-                        devices = discoveredDevices.map { it.serviceName },
+                        devices = discoveredDevices
+                            .filter { !it.serviceName.contains(Build.MODEL) }
+                            .map { it.serviceName },
                         onBack = {
                             currentScreen.value = Screen.Main
                             stopDiscovery()
                             stopAudioPlayback()
-                        }
+                            stopForegroundService()
+                        },
+                        onManualConnect = { ip -> connectToWardByIp(ip) }
                     )
                     Screen.Ward -> WardScreen(
+                        connectedGuardians = connectedGuardians,
+                        localIp = localIpAddress.value,
                         onBack = {
                             currentScreen.value = Screen.Main
                             stopAudioBroadcast()
+                            stopForegroundService()
                         }
                     )
                 }
             }
         }
     }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= 26) { // Build.VERSION_CODES.O
+            try {
+                val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+                // Use reflection to avoid compile-time dependency on API 26+
+                val channelClass = Class.forName("android.app.NotificationChannel")
+                val constructor = channelClass.getConstructor(String::class.java, CharSequence::class.java, Int::class.javaPrimitiveType)
+                val channel = constructor.newInstance(NOTIFICATION_CHANNEL_ID, "Guardian Angel Service", 2) // IMPORTANCE_LOW = 2
+
+                // Set description
+                val descField = channelClass.getMethod("setDescription", String::class.java)
+                descField.invoke(channel, "Keeps the audio streaming service running")
+
+                // Create channel
+                val createMethod = NotificationManager::class.java.getMethod("createNotificationChannel", channelClass)
+                createMethod.invoke(notificationManager, channel)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error creating notification channel: ${e.message}")
+            }
+        }
+    }
+
+    private fun startForegroundService(title: String, text: String) {
+        val intent = Intent(this, ForegroundService::class.java).apply {
+            putExtra("title", title)
+            putExtra("text", text)
+        }
+
+        // Start and bind to foreground service with API level check
+        if (Build.VERSION.SDK_INT >= 26) { // Build.VERSION_CODES.O
+            ContextCompat.startForegroundService(this, intent)
+        } else {
+            startService(intent)
+        }
+        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+    }
+
+    private fun stopForegroundService() {
+        if (serviceBound) {
+            unbindService(serviceConnection)
+            serviceBound = false
+        }
+        stopService(Intent(this, ForegroundService::class.java))
+        foregroundService = null
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        if (serviceBound) {
+            unbindService(serviceConnection)
+        }
+    }
+
+    private fun getLocalIpAddress(): String {
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val intf = interfaces.nextElement()
+                val addresses = intf.inetAddresses
+                while (addresses.hasMoreElements()) {
+                    val addr = addresses.nextElement()
+                    if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
+                        return addr.hostAddress ?: ""
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting local IP: ${e.message}")
+        }
+        return "Unknown"
+    }
     
     internal fun startBroadcasting() {
+        // Check permission first
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED) {
+            requestMicrophonePermission()
+            return
+        }
+
         val deviceName = Build.MODEL
+        startForegroundService("Ward Active", "Waiting for guardian connection...")
 
         // Start server socket for audio streaming
         thread {
@@ -132,10 +259,12 @@ class MainActivity : ComponentActivity() {
                     })
 
                 // Wait for Guardian to connect
-                while (!isStreaming) {
+                while (serverSocket != null && !serverSocket!!.isClosed) {
                     val client = serverSocket?.accept()
                     client?.let {
-                        Log.d(TAG, "Guardian connected")
+                        val guardianIp = it.inetAddress.hostAddress ?: "Unknown"
+                        Log.d(TAG, "Guardian connected from $guardianIp")
+                        connectedGuardians.add(guardianIp)
                         startAudioCapture(it.getOutputStream())
                     }
                 }
@@ -146,6 +275,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startAudioCapture(outputStream: OutputStream) {
+        // Check permission before starting recording
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED) {
+            Log.e(TAG, "Record audio permission not granted")
+            return
+        }
+
         isStreaming = true
         thread {
             try {
@@ -172,6 +308,8 @@ class MainActivity : ComponentActivity() {
                         outputStream.write(buffer, 0, bytesRead)
                     }
                 }
+            } catch (e: SecurityException) {
+                Log.e(TAG, "Security exception - permission denied: ${e.message}")
             } catch (e: Exception) {
                 Log.e(TAG, "Audio capture error: ${e.message}")
             } finally {
@@ -228,6 +366,7 @@ class MainActivity : ComponentActivity() {
     internal fun connectToWard(deviceName: String) {
         val serviceInfo = discoveredDevices.find { it.serviceName == deviceName }
         serviceInfo?.let {
+            startForegroundService("Guardian Active", "Connected to ward")
             thread {
                 try {
                     val socket = Socket(it.host, it.port)
@@ -236,6 +375,19 @@ class MainActivity : ComponentActivity() {
                 } catch (e: Exception) {
                     Log.e(TAG, "Connection error: ${e.message}")
                 }
+            }
+        }
+    }
+
+    internal fun connectToWardByIp(ipAddress: String) {
+        startForegroundService("Guardian Active", "Connecting to ward...")
+        thread {
+            try {
+                val socket = Socket(ipAddress, AUDIO_PORT)
+                Log.d(TAG, "Connected to ward at $ipAddress:$AUDIO_PORT")
+                startAudioPlayback(socket.getInputStream())
+            } catch (e: Exception) {
+                Log.e(TAG, "Manual connection error: ${e.message}")
             }
         }
     }
@@ -360,7 +512,11 @@ fun MainScreen(
 }
 
 @Composable
-fun WardScreen(onBack: () -> Unit) {
+fun WardScreen(
+    connectedGuardians: List<String>,
+    localIp: String,
+    onBack: () -> Unit
+) {
     val activity = androidx.compose.ui.platform.LocalContext.current as? MainActivity
     val showDialog = remember { mutableStateOf(false) }
 
@@ -383,8 +539,8 @@ fun WardScreen(onBack: () -> Unit) {
             IconButton(
                 onClick = { showDialog.value = true },
                 modifier = Modifier
-                    .align(Alignment.CenterStart)
-                    .padding(start = 8.dp, top = 32.dp)
+                    .align(Alignment.BottomStart)
+                    .padding(start = 8.dp, bottom = 8.dp)
             ) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.ArrowBack,
@@ -395,8 +551,8 @@ fun WardScreen(onBack: () -> Unit) {
             Text(
                 text = "WARD",
                 modifier = Modifier
-                    .align(Alignment.Center)
-                    .padding(top = 32.dp),
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 8.dp),
                 style = TextStyle(
                     fontSize = 32.sp,
                     fontWeight = FontWeight.Bold,
@@ -405,21 +561,89 @@ fun WardScreen(onBack: () -> Unit) {
             )
         }
 
-        // Status Message
-        Box(
+        // Content
+        Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(16.dp),
-            contentAlignment = Alignment.Center
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            // Local IP
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF2C2C2C), shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
+                    .padding(16.dp)
+            ) {
+                Column {
+                    Text(
+                        text = "Local IP Address",
+                        style = TextStyle(
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = Color.Gray
+                        )
+                    )
+                    Text(
+                        text = localIp,
+                        style = TextStyle(
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
+                    )
+                }
+            }
+
+            // Connected Guardians
             Text(
-                text = "Ward is active",
+                text = "Connected Guardians (${connectedGuardians.size})",
                 style = TextStyle(
-                    fontSize = 24.sp,
-                    fontWeight = FontWeight.Medium,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
                     color = Color.White
                 )
             )
+
+            if (connectedGuardians.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF2C2C2C), shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
+                        .padding(16.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "Waiting for guardian connections...",
+                        style = TextStyle(
+                            fontSize = 14.sp,
+                            color = Color.Gray
+                        )
+                    )
+                }
+            } else {
+                LazyColumn(
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(connectedGuardians) { guardian ->
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(Color(0xFF2C2C2C), shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
+                                .padding(16.dp)
+                        ) {
+                            Text(
+                                text = guardian,
+                                style = TextStyle(
+                                    fontSize = 16.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = Color.White
+                                )
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -455,7 +679,6 @@ fun WardScreen(onBack: () -> Unit) {
 
     // Request permissions and start broadcasting
     activity?.apply {
-        requestMicrophonePermission()
         startBroadcasting()
     }
 }
@@ -463,10 +686,13 @@ fun WardScreen(onBack: () -> Unit) {
 @Composable
 fun GuardianScreen(
     devices: List<String>,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onManualConnect: (String) -> Unit
 ) {
     val activity = androidx.compose.ui.platform.LocalContext.current as? MainActivity
     val showDialog = remember { mutableStateOf(false) }
+    val showManualConnectDialog = remember { mutableStateOf(false) }
+    val manualIpAddress = remember { mutableStateOf("") }
 
     BackHandler {
         showDialog.value = true
@@ -487,8 +713,8 @@ fun GuardianScreen(
             IconButton(
                 onClick = { showDialog.value = true },
                 modifier = Modifier
-                    .align(Alignment.CenterStart)
-                    .padding(start = 8.dp, top = 32.dp)
+                    .align(Alignment.BottomStart)
+                    .padding(start = 8.dp, bottom = 8.dp)
             ) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.ArrowBack,
@@ -499,8 +725,8 @@ fun GuardianScreen(
             Text(
                 text = "GUARDIAN",
                 modifier = Modifier
-                    .align(Alignment.Center)
-                    .padding(top = 32.dp),
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 8.dp),
                 style = TextStyle(
                     fontSize = 32.sp,
                     fontWeight = FontWeight.Bold,
@@ -509,35 +735,105 @@ fun GuardianScreen(
             )
         }
 
-        // Devices List
-        LazyColumn(
+        // Content
+        Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            items(devices) { device ->
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color(0xFF2C2C2C), shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
-                        .clickable {
-                            activity?.connectToWard(device)
-                        }
-                        .padding(16.dp),
-                    contentAlignment = Alignment.CenterStart
-                ) {
-                    Text(
-                        text = device,
-                        style = TextStyle(
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.Medium,
-                            color = Color.White
+            // Manual connect button
+            Button(
+                onClick = { showManualConnectDialog.value = true },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2C5F8D))
+            ) {
+                Text("Connect Manually")
+            }
+
+            Text(
+                text = "Discovered Devices",
+                style = TextStyle(
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White
+                ),
+                modifier = Modifier.padding(top = 8.dp)
+            )
+
+            // Devices List
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(devices) { device ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF2C2C2C), shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
+                            .clickable {
+                                activity?.connectToWard(device)
+                            }
+                            .padding(16.dp),
+                        contentAlignment = Alignment.CenterStart
+                    ) {
+                        Text(
+                            text = device,
+                            style = TextStyle(
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = Color.White
+                            )
                         )
-                    )
+                    }
                 }
             }
         }
+    }
+
+    // Manual Connect Dialog
+    if (showManualConnectDialog.value) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showManualConnectDialog.value = false },
+            title = {
+                Text(text = "Manual Connection")
+            },
+            text = {
+                Column {
+                    Text(text = "Enter the ward's IP address:")
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = manualIpAddress.value,
+                        onValueChange = { manualIpAddress.value = it },
+                        label = { Text("IP Address") },
+                        placeholder = { Text("192.168.1.100") },
+                        singleLine = true
+                    )
+                }
+            },
+            confirmButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = {
+                        if (manualIpAddress.value.isNotEmpty()) {
+                            onManualConnect(manualIpAddress.value)
+                            showManualConnectDialog.value = false
+                            manualIpAddress.value = ""
+                        }
+                    }
+                ) {
+                    Text("Connect")
+                }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = {
+                        showManualConnectDialog.value = false
+                        manualIpAddress.value = ""
+                    }
+                ) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 
     // Confirmation Dialog
@@ -572,6 +868,62 @@ fun GuardianScreen(
 
     // Start discovery
     activity?.startDiscovery()
+}
+
+// Foreground Service to keep the app running
+class ForegroundService : Service() {
+    private val binder = LocalBinder()
+
+    inner class LocalBinder : Binder() {
+        fun getService(): ForegroundService = this@ForegroundService
+    }
+
+    override fun onBind(intent: Intent?): IBinder = binder
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val title = intent?.getStringExtra("title") ?: "Guardian Angel"
+        val text = intent?.getStringExtra("text") ?: "Service running"
+
+        val notification = NotificationCompat.Builder(this, MainActivity.NOTIFICATION_CHANNEL_ID)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= 29) { // Build.VERSION_CODES.Q
+            try {
+                // Use reflection for FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                val method = Service::class.java.getMethod("startForeground", Int::class.javaPrimitiveType,
+                    android.app.Notification::class.java, Int::class.javaPrimitiveType)
+                method.invoke(this, MainActivity.NOTIFICATION_ID, notification, 2) // FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK = 2
+            } catch (e: Exception) {
+                startForeground(MainActivity.NOTIFICATION_ID, notification)
+            }
+        } else {
+            startForeground(MainActivity.NOTIFICATION_ID, notification)
+        }
+
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        if (Build.VERSION.SDK_INT >= 24) { // Build.VERSION_CODES.N
+            try {
+                // Use reflection for STOP_FOREGROUND_REMOVE
+                val method = Service::class.java.getMethod("stopForeground", Int::class.javaPrimitiveType)
+                method.invoke(this, 1) // STOP_FOREGROUND_REMOVE = 1
+            } catch (e: Exception) {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+    }
 }
 
 @Preview(showBackground = true)
