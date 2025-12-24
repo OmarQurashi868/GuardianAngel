@@ -68,6 +68,13 @@ import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.example.guardianangel.model.Screen
+import com.example.guardianangel.model.GuardianConnection
+import com.example.guardianangel.ui.screens.MainScreen
+import com.example.guardianangel.ui.screens.WardScreen
+import com.example.guardianangel.ui.screens.GuardianScreen
+import com.example.guardianangel.ui.screens.GuardianConnectedScreen
+import com.example.guardianangel.service.ForegroundService
 import com.example.guardianangel.ui.theme.GuardianAngelTheme
 import java.io.InputStream
 import java.io.OutputStream
@@ -121,21 +128,20 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    companion object {
-        private const val TAG = "GuardianAngel"
-        private const val AUDIO_PORT = 5353
-        private const val PTT_PORT = 5354
-        private const val SAMPLE_RATE = 44100
-        private const val CHANNEL_CONFIG_IN = AudioFormat.CHANNEL_IN_MONO
-        private const val CHANNEL_CONFIG_OUT = AudioFormat.CHANNEL_OUT_MONO
-        private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
-        const val NOTIFICATION_CHANNEL_ID = "guardian_angel_channel"
-        const val ALERT_CHANNEL_ID = "guardian_angel_alert_channel"
-        const val NOTIFICATION_ID = 1
-        const val ALERT_NOTIFICATION_ID = 2
-        private const val REQUEST_CODE_NOTIFICATION = 101
-        private const val CONNECTION_TIMEOUT_MS = 30000L // 30 seconds
-    }
+    // Centralized constants from Constants object
+    private val TAG = com.example.guardianangel.core.Constants.TAG
+    private val AUDIO_PORT = com.example.guardianangel.core.Constants.AUDIO_PORT
+    private val PTT_PORT = com.example.guardianangel.core.Constants.PTT_PORT
+    private val SAMPLE_RATE = com.example.guardianangel.core.Constants.SAMPLE_RATE
+    private val CHANNEL_CONFIG_IN = com.example.guardianangel.core.Constants.CHANNEL_CONFIG_IN
+    private val CHANNEL_CONFIG_OUT = com.example.guardianangel.core.Constants.CHANNEL_CONFIG_OUT
+    private val AUDIO_FORMAT = com.example.guardianangel.core.Constants.AUDIO_FORMAT
+    private val NOTIFICATION_CHANNEL_ID = com.example.guardianangel.core.Constants.NOTIFICATION_CHANNEL_ID
+    private val ALERT_CHANNEL_ID = com.example.guardianangel.core.Constants.ALERT_CHANNEL_ID
+    private val NOTIFICATION_ID = com.example.guardianangel.core.Constants.NOTIFICATION_ID
+    private val ALERT_NOTIFICATION_ID = com.example.guardianangel.core.Constants.ALERT_NOTIFICATION_ID
+    private val REQUEST_CODE_NOTIFICATION = com.example.guardianangel.core.Constants.REQUEST_CODE_NOTIFICATION
+    private val CONNECTION_TIMEOUT_MS = com.example.guardianangel.core.Constants.CONNECTION_TIMEOUT_MS
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -153,17 +159,19 @@ class MainActivity : ComponentActivity() {
                         onGuardianClick = { currentScreen.value = Screen.Guardian },
                         onWardClick = { currentScreen.value = Screen.Ward }
                     )
+
                     Screen.Guardian -> GuardianScreen(
                         devices = discoveredDevices.map { it.serviceName },
                         onBack = {
-                            currentScreen.value = Screen.Main
                             stopDiscovery()
                             stopAudioPlayback()
                             stopForegroundService()
+                            currentScreen.value = Screen.Main
                         },
                         onManualConnect = { ip -> connectToWardByIp(ip, null) },
                         onDeviceConnect = { deviceName -> connectToWard(deviceName) }
                     )
+
                     is Screen.GuardianConnected -> GuardianConnectedScreen(
                         wardName = screen.wardName,
                         volume = streamVolume.value,
@@ -171,7 +179,17 @@ class MainActivity : ComponentActivity() {
                         isConnected = isConnectedToWard.value,
                         onVolumeChange = { newVolume ->
                             streamVolume.value = newVolume
-                            audioTrack?.setVolume(newVolume)
+                            audioTrack?.let { track ->
+                                try {
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                                        track.setVolume(newVolume)
+                                    } else {
+                                        track.setStereoVolume(newVolume, newVolume)
+                                    }
+                                } catch (_: Exception) {
+                                    Log.w(TAG, "Failed to set volume")
+                                }
+                            }
                         },
                         onPttPress = {
                             connectedWardIp.value?.let { startPushToTalk(it) }
@@ -180,18 +198,19 @@ class MainActivity : ComponentActivity() {
                             stopPushToTalk()
                         },
                         onBack = {
-                            currentScreen.value = Screen.Main
                             stopAudioPlayback()
                             stopForegroundService()
+                            currentScreen.value = Screen.Main
                         }
                     )
+
                     Screen.Ward -> WardScreen(
                         connectedGuardians = connectedGuardians.map { it.deviceName },
                         localIp = localIpAddress.value,
                         onBack = {
-                            currentScreen.value = Screen.Main
                             stopAudioBroadcast()
                             stopForegroundService()
+                            currentScreen.value = Screen.Main
                         }
                     )
                 }
@@ -201,40 +220,100 @@ class MainActivity : ComponentActivity() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= 26) { // Build.VERSION_CODES.O
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             try {
-                val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-
-                // Use reflection to avoid compile-time dependency on API 26+
                 val channelClass = Class.forName("android.app.NotificationChannel")
-                val constructor = channelClass.getConstructor(String::class.java, CharSequence::class.java, Int::class.javaPrimitiveType)
+
+                // Try to obtain the constructor safely
+                val constructor = try {
+                    channelClass.getConstructor(
+                        String::class.java,
+                        CharSequence::class.java,
+                        Int::class.javaPrimitiveType
+                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "NotificationChannel constructor not found: ${e.message}")
+                    null
+                }
 
                 // Service notification channel
-                val channel = constructor.newInstance(NOTIFICATION_CHANNEL_ID, "Guardian Angel Service", 2) // IMPORTANCE_LOW = 2
-                val descField = channelClass.getMethod("setDescription", String::class.java)
-                descField.invoke(channel, "Keeps the audio streaming service running")
-                val createMethod = NotificationManager::class.java.getMethod("createNotificationChannel", channelClass)
-                createMethod.invoke(notificationManager, channel)
+                val serviceChannel = try {
+                    constructor?.newInstance(NOTIFICATION_CHANNEL_ID, "Guardian Angel Service", 2) // IMPORTANCE_LOW = 2
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to instantiate service channel: ${e.message}")
+                    null
+                }
 
-                // Alert notification channel with high importance and DND bypass
-                val alertChannel = constructor.newInstance(ALERT_CHANNEL_ID, "Connection Alerts", 5) // IMPORTANCE_HIGH = 5
-                descField.invoke(alertChannel, "Alerts when connection is lost")
+                if (serviceChannel != null) {
+                    // Description (optional)
+                    try {
+                        val setDescription = channelClass.getMethod("setDescription", String::class.java)
+                        setDescription.invoke(serviceChannel, "Keeps the audio streaming service running")
+                    } catch (e: Exception) {
+                        Log.w(TAG, "setDescription not supported for service channel: ${e.message}")
+                    }
 
-                // Set sound
-                val defaultSoundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-                val audioAttributes = AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ALARM)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                    .build()
-                val setSoundMethod = channelClass.getMethod("setSound", Uri::class.java, AudioAttributes::class.java)
-                setSoundMethod.invoke(alertChannel, defaultSoundUri, audioAttributes)
+                    // Create channel
+                    try {
+                        val createMethod =
+                            NotificationManager::class.java.getMethod("createNotificationChannel", channelClass)
+                        createMethod.invoke(notificationManager, serviceChannel)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "createNotificationChannel failed for service channel: ${e.message}")
+                    }
+                }
 
-                // Set to bypass DND
-                val setBypassDndMethod = channelClass.getMethod("setBypassDnd", Boolean::class.javaPrimitiveType)
-                setBypassDndMethod.invoke(alertChannel, true)
+                // Alert notification channel
+                val alertChannel = try {
+                    constructor?.newInstance(ALERT_CHANNEL_ID, "Connection Alerts", 5) // IMPORTANCE_HIGH = 5
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to instantiate alert channel: ${e.message}")
+                    null
+                }
 
-                createMethod.invoke(notificationManager, alertChannel)
+                if (alertChannel != null) {
+                    // Description (optional)
+                    try {
+                        val setDescription = channelClass.getMethod("setDescription", String::class.java)
+                        setDescription.invoke(alertChannel, "Alerts when connection is lost")
+                    } catch (e: Exception) {
+                        Log.w(TAG, "setDescription not supported for alert channel: ${e.message}")
+                    }
+
+                    // Sound (optional)
+                    try {
+                        val defaultSoundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+                        val audioAttributes = AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_ALARM)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build()
+                        val setSoundMethod =
+                            channelClass.getMethod("setSound", Uri::class.java, AudioAttributes::class.java)
+                        setSoundMethod.invoke(alertChannel, defaultSoundUri, audioAttributes)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "setSound not supported for alert channel: ${e.message}")
+                    }
+
+                    // Bypass DND (optional)
+                    try {
+                        val setBypassDndMethod =
+                            channelClass.getMethod("setBypassDnd", Boolean::class.javaPrimitiveType)
+                        setBypassDndMethod.invoke(alertChannel, true)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "setBypassDnd not supported for alert channel: ${e.message}")
+                    }
+
+                    // Create alert channel
+                    try {
+                        val createMethod =
+                            NotificationManager::class.java.getMethod("createNotificationChannel", channelClass)
+                        createMethod.invoke(notificationManager, alertChannel)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "createNotificationChannel failed for alert channel: ${e.message}")
+                    }
+                }
             } catch (e: Exception) {
-                Log.e(TAG, "Error creating notification channel: ${e.message}")
+                Log.e(TAG, "Error creating notification channels: ${e.message}")
             }
         }
     }
@@ -265,8 +344,27 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        if (serviceBound) {
-            unbindService(serviceConnection)
+        try {
+            if (serviceBound) {
+                unbindService(serviceConnection)
+            }
+        } catch (_: Exception) {
+        }
+        try {
+            stopAudioPlayback()
+        } catch (_: Exception) {
+        }
+        try {
+            stopAudioBroadcast()
+        } catch (_: Exception) {
+        }
+        try {
+            stopDiscovery()
+        } catch (_: Exception) {
+        }
+        try {
+            stopForegroundService()
+        } catch (_: Exception) {
         }
     }
 
@@ -338,7 +436,10 @@ class MainActivity : ComponentActivity() {
                                 pttAudioTrack?.stop()
                                 pttAudioTrack?.release()
                                 pttAudioTrack = null
-                                try { socket.close() } catch (e: Exception) { }
+                                try {
+                                    socket.close()
+                                } catch (e: Exception) {
+                                }
                                 Log.d(TAG, "PTT client disconnected")
                             }
                         }
@@ -353,7 +454,8 @@ class MainActivity : ComponentActivity() {
     internal fun startBroadcasting() {
         // Check permission first
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED) {
+            != PackageManager.PERMISSION_GRANTED
+        ) {
             requestMicrophonePermission()
             return
         }
@@ -380,12 +482,15 @@ class MainActivity : ComponentActivity() {
                     override fun onServiceRegistered(nsdServiceInfo: NsdServiceInfo) {
                         Log.d(TAG, "Service registered: ${nsdServiceInfo.serviceName}")
                     }
+
                     override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
                         Log.e(TAG, "Registration failed: $errorCode")
                     }
+
                     override fun onServiceUnregistered(arg0: NsdServiceInfo) {
                         Log.d(TAG, "Service unregistered")
                     }
+
                     override fun onUnregistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
                         Log.e(TAG, "Unregistration failed: $errorCode")
                     }
@@ -471,7 +576,8 @@ class MainActivity : ComponentActivity() {
     private fun startAudioCapture() {
         // Check permission before starting recording
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED) {
+            != PackageManager.PERMISSION_GRANTED
+        ) {
             Log.e(TAG, "Record audio permission not granted")
             return
         }
@@ -479,21 +585,49 @@ class MainActivity : ComponentActivity() {
         isStreaming = true
         thread {
             try {
-                val bufferSize = AudioRecord.getMinBufferSize(
+                val minBuffer = AudioRecord.getMinBufferSize(
                     SAMPLE_RATE,
                     CHANNEL_CONFIG_IN,
                     AUDIO_FORMAT
-                ) * 2  // Larger buffer for better quality
-
+                )
+                if (minBuffer <= 0) {
+                    Log.e(TAG, "Invalid AudioRecord min buffer size: $minBuffer")
+                    isStreaming = false
+                    return@thread
+                }
+                val bufferSize = minBuffer * 2 // Larger buffer for better quality
                 audioRecord = AudioRecord(
-                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,  // Better pickup for voice
+                    MediaRecorder.AudioSource.MIC,  // Changed from VOICE_COMMUNICATION -> MIC for better compatibility
                     SAMPLE_RATE,
                     CHANNEL_CONFIG_IN,
                     AUDIO_FORMAT,
                     bufferSize
                 )
 
-                audioRecord?.startRecording()
+                if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                    Log.e(TAG, "AudioRecord failed to initialize (state=${audioRecord?.state})")
+                    try {
+                        audioRecord?.release()
+                    } catch (e: Exception) {
+                    }
+                    audioRecord = null
+                    isStreaming = false
+                    return@thread
+                }
+
+                try {
+                    if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
+                        audioRecord?.startRecording()
+                    } else {
+                        Log.e(TAG, "AudioRecord not initialized at startRecording (state=${audioRecord?.state})")
+                        isStreaming = false
+                        return@thread
+                    }
+                } catch (e: IllegalStateException) {
+                    Log.e(TAG, "startRecording failed: ${e.message}")
+                    isStreaming = false
+                    return@thread
+                }
                 val buffer = ByteArray(bufferSize)
 
                 while (isStreaming) {
@@ -505,30 +639,36 @@ class MainActivity : ComponentActivity() {
                             amplifyAudio(buffer, bytesRead, 3.5f)
 
                             // Broadcast to all connected guardians
-                            val socketsToRemove = mutableListOf<Socket>()
-                            synchronized(clientSockets) {
-                                clientSockets.forEach { socket ->
-                                    try {
-                                        socket.getOutputStream().write(buffer, 0, bytesRead)
-                                        socket.getOutputStream().flush()
-                                    } catch (e: Exception) {
-                                        Log.e(TAG, "Failed to write to guardian: ${e.message}")
-                                        socketsToRemove.add(socket)
+                            val toRemove = mutableListOf<Socket>()
+                            // Take a snapshot to avoid ConcurrentModification and to skip sockets already closed
+                            val snapshot: List<Socket> = synchronized(clientSockets) { clientSockets.toList() }
+                            snapshot.forEach { s ->
+                                try {
+                                    if (s.isClosed || !s.isConnected) {
+                                        toRemove.add(s)
+                                    } else {
+                                        val out = s.getOutputStream()
+                                        out.write(buffer, 0, bytesRead)
+                                        out.flush()
                                     }
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "Failed to write to guardian: ${e.message}")
+                                    toRemove.add(s)
                                 }
                             }
-
-                            // Remove dead sockets
-                            if (socketsToRemove.isNotEmpty()) {
+                            if (toRemove.isNotEmpty()) {
                                 synchronized(clientSockets) {
-                                    socketsToRemove.forEach { socket ->
-                                        clientSockets.remove(socket)
-                                        try { socket.close() } catch (e: Exception) { }
+                                    toRemove.forEach { sock ->
+                                        clientSockets.remove(sock)
+                                        try {
+                                            sock.close()
+                                        } catch (_: Exception) {
+                                        }
                                     }
                                 }
                                 runOnUiThread {
-                                    socketsToRemove.forEach { socket ->
-                                        connectedGuardians.removeAll { it.socket == socket }
+                                    toRemove.forEach { sock ->
+                                        connectedGuardians.removeAll { it.socket == sock }
                                     }
                                 }
                             }
@@ -555,13 +695,14 @@ class MainActivity : ComponentActivity() {
             try {
                 val inputStream = socket.getInputStream()
                 val buffer = ByteArray(1)
+                socket.soTimeout = 5000 // 5 second timeout
 
                 // Continuously monitor the socket
-                while (!socket.isClosed && socket.isConnected) {
+                while (!socket.isClosed && socket.isConnected && !Thread.currentThread().isInterrupted) {
                     // Try to read 1 byte with timeout to detect disconnection
                     try {
-                        socket.soTimeout = 5000 // 5 second timeout
-                        val read = inputStream.read(buffer, 0, 0)
+                        /* timeout set once above */
+                        val read = inputStream.read(buffer, 0, 1)
                         if (read == -1) {
                             // Connection closed by remote
                             break
@@ -585,25 +726,50 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread {
                     connectedGuardians.removeAll { it.socket == socket }
                 }
-                try { socket.close() } catch (e: Exception) { }
+                try {
+                    socket.close()
+                } catch (e: Exception) {
+                }
                 Log.d(TAG, "Guardian $guardianName disconnected")
             }
         }
     }
 
     private fun stopAudioBroadcast() {
+        // Idempotent guard to avoid repeated work
+        if (!isStreaming && serverSocket == null && pttServerSocket == null) {
+            Log.d(TAG, "stopAudioBroadcast: already stopped")
+            return
+        }
         isStreaming = false
 
-        // Close all client sockets first
+        // Close all client sockets first (shutdown IO defensively)
         synchronized(clientSockets) {
-            clientSockets.forEach {
-                try { it.close() } catch (e: Exception) { }
+            clientSockets.forEach { s ->
+                try {
+                    if (!s.isClosed) {
+                        try {
+                            s.shutdownInput()
+                        } catch (_: Exception) {
+                        }
+                        try {
+                            s.shutdownOutput()
+                        } catch (_: Exception) {
+                        }
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    try {
+                        s.close()
+                    } catch (_: Exception) {
+                    }
+                }
             }
             clientSockets.clear()
         }
 
         // Give audio thread time to finish
-        Thread.sleep(100)
+        // removed blocking sleep
 
         // Stop and release audio resources safely
         try {
@@ -633,33 +799,48 @@ class MainActivity : ComponentActivity() {
 
         // Close server sockets
         try {
-            serverSocket?.close()
+            val ss = serverSocket
+            if (ss != null && !ss.isClosed) {
+                ss.close()
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error closing server socket: ${e.message}")
+        } finally {
+            serverSocket = null
         }
-        serverSocket = null
 
         try {
-            pttServerSocket?.close()
+            val ps = pttServerSocket
+            if (ps != null && !ps.isClosed) {
+                ps.close()
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error closing PTT server socket: ${e.message}")
+        } finally {
+            pttServerSocket = null
         }
-        pttServerSocket = null
 
         // Clear UI state
         runOnUiThread {
             connectedGuardians.clear()
         }
 
-        // Unregister NSD service
-        try {
-            registrationListener?.let {
-                nsdManager?.unregisterService(it)
-                Log.d(TAG, "Unregistering NSD service")
+        // Unregister NSD service (only if previously registered)
+        val listener = registrationListener
+        if (listener != null) {
+            try {
+                nsdManager?.unregisterService(listener)
+                Log.d(TAG, "Unregistered NSD service")
+            } catch (e: IllegalArgumentException) {
+                // Already unregistered or not registered
+                Log.w(TAG, "NSD service not registered: ${e.message}")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error unregistering service: ${e.message}")
+            } finally {
+                registrationListener = null
             }
-            registrationListener = null
-        } catch (e: Exception) {
-            Log.e(TAG, "Error unregistering service: ${e.message}")
+        } else {
+            Log.d(TAG, "No NSD registration to unregister")
         }
     }
 
@@ -680,8 +861,12 @@ class MainActivity : ComponentActivity() {
                         isResolving = false
                         resolveNext()
                     }
+
                     override fun onServiceResolved(resolvedInfo: NsdServiceInfo) {
-                        Log.d(TAG, "Service resolved: ${resolvedInfo.serviceName} at ${resolvedInfo.host}:${resolvedInfo.port}")
+                        Log.d(
+                            TAG,
+                            "Service resolved: ${resolvedInfo.serviceName} at ${resolvedInfo.host}:${resolvedInfo.port}"
+                        )
                         runOnUiThread {
                             if (!discoveredDevices.any { it.serviceName == resolvedInfo.serviceName }) {
                                 discoveredDevices.add(resolvedInfo)
@@ -713,20 +898,25 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
                 Log.e(TAG, "Discovery stop failed: $errorCode")
             }
+
             override fun onDiscoveryStarted(serviceType: String) {
                 Log.d(TAG, "Discovery started for $serviceType")
             }
+
             override fun onDiscoveryStopped(serviceType: String) {
                 Log.d(TAG, "Discovery stopped")
             }
+
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
                 Log.d(TAG, "Service found: ${serviceInfo.serviceName}")
                 resolveQueue.add(serviceInfo)
                 resolveNext()
             }
+
             override fun onServiceLost(serviceInfo: NsdServiceInfo) {
                 Log.d(TAG, "Service lost: ${serviceInfo.serviceName}")
                 // Don't immediately remove - let devices stay in list for manual connection
@@ -824,7 +1014,7 @@ class MainActivity : ComponentActivity() {
 
             val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
-            val builder = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
+            val builder = NotificationCompat.Builder(this, this@MainActivity.ALERT_CHANNEL_ID)
                 .setContentTitle("Connection Lost!")
                 .setContentText("Ward connection has been lost for more than 30 seconds")
                 .setSmallIcon(android.R.drawable.ic_dialog_alert)
@@ -840,7 +1030,7 @@ class MainActivity : ComponentActivity() {
                 builder.setFullScreenIntent(pendingIntent, true)
             }
 
-            notificationManager.notify(ALERT_NOTIFICATION_ID, builder.build())
+            notificationManager.notify(this@MainActivity.ALERT_NOTIFICATION_ID, builder.build())
         }
     }
 
@@ -871,17 +1061,42 @@ class MainActivity : ComponentActivity() {
                     AudioTrack.MODE_STREAM
                 )
 
-                audioTrack?.setStereoVolume(streamVolume.value, streamVolume.value)
+                audioTrack?.let { track ->
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                            track.setVolume(streamVolume.value)
+                        } else {
+                            track.setStereoVolume(streamVolume.value, streamVolume.value)
+                        }
+                    } catch (_: Exception) {
+                        Log.w(TAG, "Failed to set initial audio volume")
+                    }
+                }
                 audioTrack?.play()
                 val buffer = ByteArray(bufferSize)
 
-                while (isPlayingAudio && !socket.isClosed && socket.isConnected) {
+                while (
+                    isPlayingAudio &&
+                    !socket.isClosed &&
+                    socket.isConnected &&
+                    !Thread.currentThread().isInterrupted
+                ) {
                     try {
                         val bytesRead = inputStream.read(buffer)
-                        if (bytesRead == -1) break
+                        if (bytesRead <= 0) continue
                         // Update last connection time when data is received
                         lastConnectionTime = System.currentTimeMillis()
-                        audioTrack?.write(buffer, 0, bytesRead)
+                        val track = audioTrack
+                        if (track == null) {
+                            Log.d(TAG, "AudioTrack is null, stopping playback loop")
+                            break
+                        }
+                        try {
+                            track.write(buffer, 0, bytesRead)
+                        } catch (e: IllegalStateException) {
+                            Log.e(TAG, "AudioTrack write failed: ${e.message}")
+                            break
+                        }
                     } catch (e: java.net.SocketException) {
                         // Socket closed, exit gracefully
                         Log.d(TAG, "Socket closed during playback")
@@ -889,6 +1104,9 @@ class MainActivity : ComponentActivity() {
                     } catch (e: java.io.IOException) {
                         // IO error, connection lost
                         Log.d(TAG, "Connection lost during playback")
+                        break
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Unexpected error during playback: ${e.message}")
                         break
                     }
                 }
@@ -912,10 +1130,12 @@ class MainActivity : ComponentActivity() {
 
                 try {
                     inputStream.close()
-                } catch (e: Exception) { }
+                } catch (e: Exception) {
+                }
                 try {
                     socket.close()
-                } catch (e: Exception) { }
+                } catch (e: Exception) {
+                }
                 guardianSocket = null
 
                 runOnUiThread {
@@ -923,6 +1143,8 @@ class MainActivity : ComponentActivity() {
                         currentScreen.value = Screen.Guardian
                         startDiscovery()
                     }
+                    isConnectedToWard.value = false
+                    isPttActive.value = false
                     stopForegroundService()
                 }
             }
@@ -934,7 +1156,8 @@ class MainActivity : ComponentActivity() {
 
         // Check permission first
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED) {
+            != PackageManager.PERMISSION_GRANTED
+        ) {
             requestMicrophonePermission()
             return
         }
@@ -947,11 +1170,15 @@ class MainActivity : ComponentActivity() {
                 pttSocket = Socket(wardIp, PTT_PORT)
                 Log.d(TAG, "PTT connected to ward at $wardIp:$PTT_PORT")
 
-                val bufferSize = AudioRecord.getMinBufferSize(
+                val minBuffer = AudioRecord.getMinBufferSize(
                     SAMPLE_RATE,
                     CHANNEL_CONFIG_IN,
                     AUDIO_FORMAT
                 )
+                if (minBuffer <= 0) {
+                    throw IllegalStateException("Invalid PTT min buffer size: $minBuffer")
+                }
+                val bufferSize = minBuffer * 2
 
                 pttAudioRecord = AudioRecord(
                     MediaRecorder.AudioSource.MIC,
@@ -961,19 +1188,34 @@ class MainActivity : ComponentActivity() {
                     bufferSize
                 )
 
-                pttAudioRecord?.startRecording()
+                val recorder = pttAudioRecord
+                if (recorder == null || recorder.state != AudioRecord.STATE_INITIALIZED) {
+                    throw IllegalStateException("PTT AudioRecord not initialized (state=${pttAudioRecord?.state})")
+                }
+                try {
+                    recorder.startRecording()
+                } catch (e: IllegalStateException) {
+                    throw IllegalStateException("PTT startRecording failed: ${e.message}")
+                }
+
                 val buffer = ByteArray(bufferSize)
                 val outputStream = pttSocket?.getOutputStream()
+                    ?: throw IllegalStateException("PTT output stream is null")
 
                 while (isPttActive.value && pttSocket?.isConnected == true) {
-                    val bytesRead = pttAudioRecord?.read(buffer, 0, bufferSize) ?: 0
-                    if (bytesRead > 0) {
-                        outputStream?.write(buffer, 0, bytesRead)
-                        outputStream?.flush()
+                    val bytesRead = pttAudioRecord?.read(buffer, 0, bufferSize) ?: -1
+                    if (bytesRead <= 0) continue
+                    try {
+                        outputStream.write(buffer, 0, bytesRead)
+                        outputStream.flush()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "PTT write failed: ${e.message}")
+                        break
                     }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "PTT error: ${e.message}")
+                isPttActive.value = false
             } finally {
                 stopPushToTalk()
             }
@@ -984,7 +1226,10 @@ class MainActivity : ComponentActivity() {
         isPttActive.value = false
 
         try {
-            pttAudioRecord?.stop()
+            val rec = pttAudioRecord
+            if (rec != null && rec.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                rec.stop()
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error stopping PTT audio: ${e.message}")
         }
@@ -995,6 +1240,10 @@ class MainActivity : ComponentActivity() {
         }
         pttAudioRecord = null
 
+        try {
+            pttSocket?.shutdownOutput()
+        } catch (_: Exception) {
+        }
         try {
             pttSocket?.close()
         } catch (e: Exception) {
@@ -1017,7 +1266,7 @@ class MainActivity : ComponentActivity() {
         guardianSocket = null
 
         // Give thread time to exit
-        Thread.sleep(100)
+        // removed blocking sleep
 
         try {
             audioTrack?.stop()
@@ -1032,17 +1281,22 @@ class MainActivity : ComponentActivity() {
         audioTrack = null
         connectedWardName.value = null
         connectedWardIp.value = null
+        isConnectedToWard.value = false
     }
 
     private fun stopDiscovery() {
+        val listener = discoveryListener
+        if (listener == null) {
+            Log.d(TAG, "Stopping discovery: no active listener")
+            return
+        }
         try {
-            discoveryListener?.let {
-                nsdManager?.stopServiceDiscovery(it)
-                Log.d(TAG, "Stopping discovery")
-            }
-            discoveryListener = null
+            nsdManager?.stopServiceDiscovery(listener)
+            Log.d(TAG, "Stopping discovery")
         } catch (e: Exception) {
             Log.e(TAG, "Error stopping discovery: ${e.message}")
+        } finally {
+            discoveryListener = null
         }
     }
 
@@ -1057,7 +1311,8 @@ class MainActivity : ComponentActivity() {
     private fun requestNotificationPermission() {
         if (Build.VERSION.SDK_INT >= 33) { // Build.VERSION_CODES.TIRAMISU
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED) {
+                != PackageManager.PERMISSION_GRANTED
+            ) {
                 ActivityCompat.requestPermissions(
                     this,
                     arrayOf(Manifest.permission.POST_NOTIFICATIONS),
@@ -1066,745 +1321,4 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-}
-
-sealed class Screen {
-    object Main : Screen()
-    object Guardian : Screen()
-    object Ward : Screen()
-    data class GuardianConnected(val wardName: String) : Screen()
-}
-
-data class GuardianConnection(
-    val deviceName: String,
-    val ipAddress: String,
-    val socket: Socket
-)
-
-@Composable
-fun MainScreen(
-    onGuardianClick: () -> Unit,
-    onWardClick: () -> Unit
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFF1A1A1A)),
-        verticalArrangement = Arrangement.Center
-    ) {
-        // Top Button - GUARDIAN (Dark Blue)
-        Button(
-            onClick = onGuardianClick,
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f),
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2C5F8D)),
-            shape = androidx.compose.foundation.shape.RoundedCornerShape(0.dp)
-        ) {
-            Text(
-                text = "GUARDIAN",
-                style = TextStyle(
-                    fontSize = 60.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White
-                )
-            )
-        }
-
-        // Bottom Button - WARD (Dark Red)
-        Button(
-            onClick = onWardClick,
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f),
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8D2C2C)),
-            shape = androidx.compose.foundation.shape.RoundedCornerShape(0.dp)
-        ) {
-            Text(
-                text = "WARD",
-                style = TextStyle(
-                    fontSize = 60.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White
-                )
-            )
-        }
-    }
-}
-
-@Composable
-fun WardScreen(
-    connectedGuardians: List<String>,
-    localIp: String,
-    onBack: () -> Unit
-) {
-    val activity = androidx.compose.ui.platform.LocalContext.current as? MainActivity
-    val showDialog = remember { mutableStateOf(false) }
-
-    BackHandler {
-        showDialog.value = true
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFF1A1A1A))
-    ) {
-        // Banner
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(80.dp)
-                .background(Color(0xFF8D2C2C))
-        ) {
-            IconButton(
-                onClick = { showDialog.value = true },
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(start = 8.dp, bottom = 8.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                    contentDescription = "Back",
-                    tint = Color.White
-                )
-            }
-            Text(
-                text = "WARD",
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = 8.dp),
-                style = TextStyle(
-                    fontSize = 32.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White
-                )
-            )
-        }
-
-        // Content
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            // Local IP
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xFF2C2C2C), shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
-                    .padding(16.dp)
-            ) {
-                Column {
-                    Text(
-                        text = "Local IP Address",
-                        style = TextStyle(
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Medium,
-                            color = Color.Gray
-                        )
-                    )
-                    Text(
-                        text = localIp,
-                        style = TextStyle(
-                            fontSize = 20.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White
-                        )
-                    )
-                }
-            }
-
-            // Connected Guardians
-            Text(
-                text = "Connected Guardians (${connectedGuardians.size})",
-                style = TextStyle(
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White
-                )
-            )
-
-            if (connectedGuardians.isEmpty()) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color(0xFF2C2C2C), shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
-                        .padding(16.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "Waiting for guardian connections...",
-                        style = TextStyle(
-                            fontSize = 14.sp,
-                            color = Color.Gray
-                        )
-                    )
-                }
-            } else {
-                LazyColumn(
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    items(connectedGuardians) { guardian ->
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .background(Color(0xFF2C2C2C), shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
-                                .padding(16.dp)
-                        ) {
-                            Text(
-                                text = guardian,
-                                style = TextStyle(
-                                    fontSize = 16.sp,
-                                    fontWeight = FontWeight.Medium,
-                                    color = Color.White
-                                )
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Confirmation Dialog
-    if (showDialog.value) {
-        androidx.compose.material3.AlertDialog(
-            onDismissRequest = { showDialog.value = false },
-            title = {
-                Text(text = "Exit Ward?")
-            },
-            text = {
-                Text(text = "Are you sure you want to go back to the main screen?")
-            },
-            confirmButton = {
-                androidx.compose.material3.TextButton(
-                    onClick = {
-                        showDialog.value = false
-                        onBack()
-                    }
-                ) {
-                    Text("Yes")
-                }
-            },
-            dismissButton = {
-                androidx.compose.material3.TextButton(
-                    onClick = { showDialog.value = false }
-                ) {
-                    Text("No")
-                }
-            }
-        )
-    }
-
-    // Request permissions and start broadcasting
-    activity?.apply {
-        startBroadcasting()
-    }
-}
-
-@Composable
-fun GuardianScreen(
-    devices: List<String>,
-    onBack: () -> Unit,
-    onManualConnect: (String) -> Unit,
-    onDeviceConnect: (String) -> Unit
-) {
-    val activity = androidx.compose.ui.platform.LocalContext.current as? MainActivity
-    val showDialog = remember { mutableStateOf(false) }
-    val showManualConnectDialog = remember { mutableStateOf(false) }
-    val manualIpAddress = remember { mutableStateOf("") }
-
-    BackHandler {
-        showDialog.value = true
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFF1A1A1A))
-    ) {
-        // Banner
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(80.dp)
-                .background(Color(0xFF2C5F8D))
-        ) {
-            IconButton(
-                onClick = { showDialog.value = true },
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(start = 8.dp, bottom = 8.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                    contentDescription = "Back",
-                    tint = Color.White
-                )
-            }
-            Text(
-                text = "GUARDIAN",
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = 8.dp),
-                style = TextStyle(
-                    fontSize = 32.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White
-                )
-            )
-        }
-
-        // Content
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(16.dp)
-        ) {
-            Text(
-                text = "Discovered Devices",
-                style = TextStyle(
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White
-                ),
-                modifier = Modifier.padding(bottom = 8.dp)
-            )
-
-            // Devices List
-            LazyColumn(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                items(devices) { device ->
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Color(0xFF2C2C2C), shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
-                            .clickable {
-                                onDeviceConnect(device)
-                            }
-                            .padding(16.dp),
-                        contentAlignment = Alignment.CenterStart
-                    ) {
-                        Text(
-                            text = device,
-                            style = TextStyle(
-                                fontSize = 16.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = Color.White
-                            )
-                        )
-                    }
-                }
-            }
-
-            // Manual connect button at bottom
-            Button(
-                onClick = { showManualConnectDialog.value = true },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 16.dp, bottom = 48.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2C5F8D))
-            ) {
-                Text(
-                    text = "Connect Manually",
-                    color = Color.White
-                )
-            }
-        }
-    }
-
-    // Manual Connect Dialog
-    if (showManualConnectDialog.value) {
-        androidx.compose.material3.AlertDialog(
-            onDismissRequest = { showManualConnectDialog.value = false },
-            title = {
-                Text(text = "Manual Connection")
-            },
-            text = {
-                Column {
-                    Text(text = "Enter the ward's IP address:")
-                    Spacer(modifier = Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = manualIpAddress.value,
-                        onValueChange = { manualIpAddress.value = it },
-                        label = { Text("IP Address") },
-                        placeholder = { Text("192.168.1.100") },
-                        singleLine = true
-                    )
-                }
-            },
-            confirmButton = {
-                androidx.compose.material3.TextButton(
-                    onClick = {
-                        if (manualIpAddress.value.isNotEmpty()) {
-                            onManualConnect(manualIpAddress.value)
-                            showManualConnectDialog.value = false
-                            manualIpAddress.value = ""
-                        }
-                    }
-                ) {
-                    Text("Connect")
-                }
-            },
-            dismissButton = {
-                androidx.compose.material3.TextButton(
-                    onClick = {
-                        showManualConnectDialog.value = false
-                        manualIpAddress.value = ""
-                    }
-                ) {
-                    Text("Cancel")
-                }
-            }
-        )
-    }
-
-    // Confirmation Dialog
-    if (showDialog.value) {
-        androidx.compose.material3.AlertDialog(
-            onDismissRequest = { showDialog.value = false },
-            title = {
-                Text(text = "Exit Guardian?")
-            },
-            text = {
-                Text(text = "Are you sure you want to go back to the main screen?")
-            },
-            confirmButton = {
-                androidx.compose.material3.TextButton(
-                    onClick = {
-                        showDialog.value = false
-                        onBack()
-                    }
-                ) {
-                    Text("Yes")
-                }
-            },
-            dismissButton = {
-                androidx.compose.material3.TextButton(
-                    onClick = { showDialog.value = false }
-                ) {
-                    Text("No")
-                }
-            }
-        )
-    }
-
-    // Start discovery once when screen is opened
-    androidx.compose.runtime.LaunchedEffect(Unit) {
-        activity?.startDiscovery()
-    }
-}
-
-@Composable
-fun GuardianConnectedScreen(
-    wardName: String,
-    volume: Float,
-    isPttActive: Boolean,
-    isConnected: Boolean,
-    onVolumeChange: (Float) -> Unit,
-    onPttPress: () -> Unit,
-    onPttRelease: () -> Unit,
-    onBack: () -> Unit
-) {
-    val showDialog = remember { mutableStateOf(false) }
-
-    BackHandler {
-        showDialog.value = true
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFF1A1A1A))
-    ) {
-        // Banner
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(80.dp)
-                .background(Color(0xFF2C5F8D))
-        ) {
-            IconButton(
-                onClick = { showDialog.value = true },
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(start = 8.dp, bottom = 8.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                    contentDescription = "Back",
-                    tint = Color.White
-                )
-            }
-            Text(
-                text = "GUARDIAN",
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = 8.dp),
-                style = TextStyle(
-                    fontSize = 32.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White
-                )
-            )
-        }
-
-        // Content
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(24.dp)
-        ) {
-            // Connected to ward
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xFF2C5F8D), shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp))
-                    .padding(24.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text(
-                        text = "Connected to",
-                        style = TextStyle(
-                            fontSize = 16.sp,
-                            color = Color.White.copy(alpha = 0.7f)
-                        )
-                    )
-                    Text(
-                        text = wardName,
-                        style = TextStyle(
-                            fontSize = 28.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White
-                        )
-                    )
-                }
-            }
-
-            // Volume control
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xFF2C2C2C), shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp))
-                    .padding(24.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Text(
-                    text = "Audio Volume",
-                    style = TextStyle(
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White
-                    )
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Text(
-                        text = "\uD83D\uDD08",
-                        style = TextStyle(fontSize = 24.sp)
-                    )
-                    androidx.compose.material3.Slider(
-                        value = volume,
-                        onValueChange = onVolumeChange,
-                        modifier = Modifier.weight(1f),
-                        valueRange = 0f..1f
-                    )
-                    Text(
-                        text = "\uD83D\uDD0A",
-                        style = TextStyle(fontSize = 24.sp)
-                    )
-                }
-                Text(
-                    text = "${(volume * 100).toInt()}%",
-                    style = TextStyle(
-                        fontSize = 24.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White
-                    ),
-                    modifier = Modifier.align(Alignment.CenterHorizontally)
-                )
-            }
-
-            // Push-to-talk button
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(120.dp)
-                    .background(
-                        if (isPttActive) Color(0xFF4CAF50) else Color(0xFF8D2C2C),
-                        shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp)
-                    )
-                    .pointerInput(Unit) {
-                        detectTapGestures(
-                            onPress = {
-                                onPttPress()
-                                tryAwaitRelease()
-                                onPttRelease()
-                            }
-                        )
-                    },
-                contentAlignment = Alignment.Center
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text(
-                        text = if (isPttActive) "🎤 TRANSMITTING" else "🎤 PUSH TO TALK",
-                        style = TextStyle(
-                            fontSize = 24.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White
-                        )
-                    )
-                    Text(
-                        text = if (isPttActive) "Release to stop" else "Hold to speak to ward",
-                        style = TextStyle(
-                            fontSize = 14.sp,
-                            color = Color.White.copy(alpha = 0.8f)
-                        )
-                    )
-                }
-            }
-
-            // Status indicator
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xFF2C2C2C), shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
-                    .padding(16.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    val statusColor = if (isConnected) Color(0xFF00FF00) else Color(0xFFFF5555)
-                    val statusText = if (isConnected) "Audio streaming active" else "Connection DISCONNECTED"
-                    Box(
-                        modifier = Modifier
-                            .width(12.dp)
-                            .height(12.dp)
-                            .background(statusColor, shape = androidx.compose.foundation.shape.CircleShape)
-                    )
-                    Text(
-                        text = statusText,
-                        style = TextStyle(
-                            fontSize = 16.sp,
-                            color = Color.White
-                        )
-                    )
-                }
-            }
-        }
-    }
-
-    // Confirmation Dialog
-    if (showDialog.value) {
-        androidx.compose.material3.AlertDialog(
-            onDismissRequest = { showDialog.value = false },
-            title = {
-                Text(text = "Disconnect?")
-            },
-            text = {
-                Text(text = "Are you sure you want to disconnect from the ward?")
-            },
-            confirmButton = {
-                androidx.compose.material3.TextButton(
-                    onClick = {
-                        showDialog.value = false
-                        onBack()
-                    }
-                ) {
-                    Text("Yes")
-                }
-            },
-            dismissButton = {
-                androidx.compose.material3.TextButton(
-                    onClick = { showDialog.value = false }
-                ) {
-                    Text("No")
-                }
-            }
-        )
-    }
-}
-
-// Foreground Service to keep the app running
-class ForegroundService : Service() {
-    private val binder = LocalBinder()
-
-    inner class LocalBinder : Binder() {
-        fun getService(): ForegroundService = this@ForegroundService
-    }
-
-    override fun onBind(intent: Intent?): IBinder = binder
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val title = intent?.getStringExtra("title") ?: "Guardian Angel"
-        val text = intent?.getStringExtra("text") ?: "Service running"
-
-        val notification = NotificationCompat.Builder(this, MainActivity.NOTIFICATION_CHANNEL_ID)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setOngoing(true)
-            .build()
-
-        if (Build.VERSION.SDK_INT >= 29) { // Build.VERSION_CODES.Q
-            try {
-                // Use reflection for FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-                val method = Service::class.java.getMethod("startForeground", Int::class.javaPrimitiveType,
-                    android.app.Notification::class.java, Int::class.javaPrimitiveType)
-                method.invoke(this, MainActivity.NOTIFICATION_ID, notification, 2) // FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK = 2
-            } catch (e: Exception) {
-                startForeground(MainActivity.NOTIFICATION_ID, notification)
-            }
-        } else {
-            startForeground(MainActivity.NOTIFICATION_ID, notification)
-        }
-
-        return START_STICKY
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        if (Build.VERSION.SDK_INT >= 24) { // Build.VERSION_CODES.N
-            try {
-                // Use reflection for STOP_FOREGROUND_REMOVE
-                val method = Service::class.java.getMethod("stopForeground", Int::class.javaPrimitiveType)
-                method.invoke(this, 1) // STOP_FOREGROUND_REMOVE = 1
-            } catch (e: Exception) {
-                @Suppress("DEPRECATION")
-                stopForeground(true)
-            }
-        } else {
-            @Suppress("DEPRECATION")
-            stopForeground(true)
-        }
-    }
-}
-
-@Preview(showBackground = true)
-@Composable
-fun MainScreenPreview() {
-    GuardianAngelTheme {
-        MainScreen(
-            onGuardianClick = {},
-            onWardClick = {}
-        )
-    };
 }
