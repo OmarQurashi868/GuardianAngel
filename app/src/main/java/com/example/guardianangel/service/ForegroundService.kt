@@ -37,7 +37,7 @@ class ForegroundService : Service() {
         val text = intent?.getStringExtra("text") ?: "Service running"
 
         val activityIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            setFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         }
         val pendingIntent = PendingIntent.getActivity(
             this,
