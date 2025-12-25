@@ -45,16 +45,19 @@ Think of each functional concern as an agent (a cohesive unit with clear respons
   - Cleans up on exiting the screen or when stopped: closes sockets, stops audio capture and playback, unregisters NSD.
 
 2) Guardian Agent (client/receiver)
-- Role: Discover available wards, connect to one, play the ward’s PCM stream, and provide push-to-talk audio back to the ward.
+- Role: Discover available wards, connect to one, play the ward's PCM stream, and provide push-to-talk audio back to the ward.
 - Network:
   - Discovers `_ward._tcp` via NSD and resolves service host addresses.
   - Connects to ward on `Constants.AUDIO_PORT` and sends its device name as a greeting string.
-  - When PTT is engaged, opens a separate socket to the ward’s `Constants.PTT_PORT` to transmit MIC audio.
+  - When PTT is engaged, opens a separate socket to the ward's `Constants.PTT_PORT` to transmit MIC audio.
 - Audio:
-  - Plays incoming PCM via `AudioTrack` with adjustable volume.
+  - Plays incoming PCM via `AudioTrack` with adjustable volume (defaults to 100%).
   - PTT uses `AudioRecord` on MIC and streams to ward.
 - Resilience:
   - Monitors incoming stream activity and raises an alert notification if no data is received for more than `Constants.CONNECTION_TIMEOUT_MS`.
+  - Connection monitor handles WiFi disconnects and socket errors gracefully without crashing.
+  - Updates connection status UI (`isConnectedToWard`) immediately when connection is lost.
+  - Alert notification uses full-screen intent to work even when phone is locked.
 
 3) NSD Agent (discovery/registration)
 - Role: DNS-SD service discovery and registration for `_ward._tcp`.
@@ -157,6 +160,8 @@ Future improvement:
 - Microphone and network permissions are required; notification permission requested on Android 13+.
 - Foreground service runs with media playback type where available for better survivability while streaming.
 - Notification channels are created via reflection for compatibility across API levels while enabling sound and DND bypass on the alert channel.
+- `WAKE_LOCK` permission enables connection loss alerts to wake device when locked.
+- Activity configured with `showWhenLocked` and `turnScreenOn` to allow full-screen intent to display over lock screen.
 
 ## Security and constraints
 
@@ -199,6 +204,29 @@ Add analytics or logs
 - Handle audio focus, noisy intents (e.g., unplug headphones), and Bluetooth routing.
 - Consider Opus or AAC to reduce bandwidth and improve quality.
 - Consider exponential backoff and retry strategies for reconnection and discovery recovery.
+
+## Recent improvements
+
+### Crash prevention and error handling
+- Added comprehensive exception handling in connection monitor to prevent crashes when WiFi disconnects or guardian exits.
+- Connection monitor now safely checks socket state and handles InterruptedException and other exceptions gracefully.
+- Audio playback error handlers now update UI state (`isConnectedToWard`) immediately when connection is lost.
+
+### Default volume
+- Changed default audio volume from 50% (0.5f) to 100% (1.0f) for better out-of-the-box experience.
+
+### Notification improvements
+- Connection loss alert notification now works when phone is locked:
+  - Added `WAKE_LOCK` permission to manifest.
+  - Activity configured with `showWhenLocked` and `turnScreenOn` attributes.
+  - Full-screen intent properly configured with separate PendingIntent for maximum compatibility.
+  - Notification uses high priority and alarm category to ensure visibility.
+
+### Status indicator
+- Status widget (green/red dot) now accurately reflects connection state:
+  - Updates `isConnectedToWard` state immediately when connection is lost (timeout, socket errors, network disconnects).
+  - Status turns red when connection drops and green when connection is active.
+  - State updates happen in all error paths (connection monitor, audio playback, socket exceptions).
 
 ## Operational runbook
 

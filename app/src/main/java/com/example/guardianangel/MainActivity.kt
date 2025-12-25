@@ -105,7 +105,7 @@ class MainActivity : ComponentActivity() {
     private var foregroundService: ForegroundService? = null
     private var serviceBound = false
     private var clientSockets = mutableListOf<Socket>()
-    val streamVolume = mutableStateOf(0.5f)
+    val streamVolume = mutableStateOf(1.0f)
     private var lastConnectionTime = 0L
     private var connectionMonitorThread: Thread? = null
     private var isMonitoringConnection = false
@@ -967,6 +967,7 @@ class MainActivity : ComponentActivity() {
             } catch (e: Exception) {
                 Log.e(TAG, "Connection error: ${e.message}")
                 runOnUiThread {
+                    isConnectedToWard.value = false
                     stopForegroundService()
                 }
             }
@@ -979,14 +980,45 @@ class MainActivity : ComponentActivity() {
 
         connectionMonitorThread = thread {
             var alertShown = false
-            while (isMonitoringConnection && !socket.isClosed) {
-                Thread.sleep(1000)
-                val timeSinceLastData = System.currentTimeMillis() - lastConnectionTime
+            try {
+                while (isMonitoringConnection) {
+                    try {
+                        // Check if socket is still valid
+                        if (socket.isClosed || !socket.isConnected) {
+                            Log.d(TAG, "Socket closed or disconnected in monitor")
+                            break
+                        }
+                        Thread.sleep(1000)
+                        val timeSinceLastData = System.currentTimeMillis() - lastConnectionTime
 
-                if (timeSinceLastData > CONNECTION_TIMEOUT_MS && !alertShown) {
-                    // Connection lost for more than 30 seconds
-                    alertShown = true
-                    showConnectionLostAlert()
+                        if (timeSinceLastData > CONNECTION_TIMEOUT_MS && !alertShown) {
+                            // Connection lost for more than 30 seconds
+                            alertShown = true
+                            runOnUiThread {
+                                isConnectedToWard.value = false
+                            }
+                            showConnectionLostAlert()
+                        }
+                    } catch (e: InterruptedException) {
+                        Log.d(TAG, "Connection monitor interrupted")
+                        break
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error in connection monitor: ${e.message}")
+                        // Connection likely lost, update UI state
+                        runOnUiThread {
+                            isConnectedToWard.value = false
+                        }
+                        if (!alertShown) {
+                            alertShown = true
+                            showConnectionLostAlert()
+                        }
+                        break
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Fatal error in connection monitor: ${e.message}")
+                runOnUiThread {
+                    isConnectedToWard.value = false
                 }
             }
         }
@@ -1004,14 +1036,33 @@ class MainActivity : ComponentActivity() {
             val intent = Intent(this, MainActivity::class.java).apply {
                 action = Intent.ACTION_MAIN
                 addCategory(Intent.CATEGORY_LAUNCHER)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
             }
 
             val pendingIntent = PendingIntent.getActivity(
                 this,
                 0,
                 intent,
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_ONE_SHOT
+            )
+
+            val fullScreenIntent = Intent(this, MainActivity::class.java).apply {
+                action = Intent.ACTION_MAIN
+                addCategory(Intent.CATEGORY_LAUNCHER)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            }
+
+            val fullScreenPendingIntent = PendingIntent.getActivity(
+                this,
+                1,
+                fullScreenIntent,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_ONE_SHOT
             )
 
             val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -1027,9 +1078,9 @@ class MainActivity : ComponentActivity() {
                 .setVibrate(longArrayOf(0, 500, 200, 500, 200, 500))
                 .setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE))
 
-            // For API 26+, set full screen intent for call-like behavior
+            // For API 26+, set full screen intent for call-like behavior (works when locked)
             if (Build.VERSION.SDK_INT >= 26) {
-                builder.setFullScreenIntent(pendingIntent, true)
+                builder.setFullScreenIntent(fullScreenPendingIntent, true)
             }
 
             notificationManager.notify(this@MainActivity.ALERT_NOTIFICATION_ID, builder.build())
@@ -1102,18 +1153,30 @@ class MainActivity : ComponentActivity() {
                     } catch (e: java.net.SocketException) {
                         // Socket closed, exit gracefully
                         Log.d(TAG, "Socket closed during playback")
+                        runOnUiThread {
+                            isConnectedToWard.value = false
+                        }
                         break
                     } catch (e: java.io.IOException) {
                         // IO error, connection lost
                         Log.d(TAG, "Connection lost during playback")
+                        runOnUiThread {
+                            isConnectedToWard.value = false
+                        }
                         break
                     } catch (e: Exception) {
                         Log.e(TAG, "Unexpected error during playback: ${e.message}")
+                        runOnUiThread {
+                            isConnectedToWard.value = false
+                        }
                         break
                     }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Audio playback error: ${e.message}")
+                runOnUiThread {
+                    isConnectedToWard.value = false
+                }
             } finally {
                 isPlayingAudio = false
                 stopConnectionMonitor()
