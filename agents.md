@@ -85,30 +85,34 @@ Think of each functional concern as an agent (a cohesive unit with clear respons
 1) Ward broadcast
 - User opens `WardScreen`.
 - `MainActivity.startBroadcasting()`:
-  - Starts Foreground Service with “Ward Active”.
+  - Starts Foreground Service with "Ward Active".
   - Registers NSD service `_ward._tcp`.
   - Opens server socket on `AUDIO_PORT` and accepts guardian clients.
   - If capture not running, initializes `AudioRecord` and begins MIC capture.
   - For each audio buffer:
-    - Applies gain and broadcasts to all connected guardian sockets (skips when PTT is being received).
+    - Applies gain and broadcasts to all connected guardian sockets (skips guardians currently sending PTT to prevent feedback loop).
   - Monitors client sockets; removes disconnected guardians and cleans resources.
+  - PTT server accepts connections and plays PTT audio locally while broadcasting it to other guardians for feedback.
 
 2) Guardian discovery and connection
 - User opens `GuardianScreen`.
 - `MainActivity.startDiscovery()` begins NSD discovery and queued resolving of services.
 - User selects a service or enters an IP.
 - `MainActivity.connectToWardByIp()`:
-  - Foreground Service “Guardian Active”.
+  - Foreground Service "Guardian Active".
   - Creates socket to ward `AUDIO_PORT`, writes guardian device name.
   - Switches to `GuardianConnectedScreen`.
   - `startAudioPlayback()` reads PCM and writes into `AudioTrack`. Updates last data timestamp each buffer; if stalled > timeout, shows alert.
+  - On connection loss, automatically attempts reconnection every 5 seconds while staying on GuardianConnected screen.
 
 3) Guardian push-to-talk
 - On `GuardianConnectedScreen`, hold PTT control:
   - `startPushToTalk()` opens socket to ward `PTT_PORT`.
   - Captures MIC via `AudioRecord` and streams to ward.
+  - Ward plays PTT audio locally and broadcasts it to all other guardians (feedback).
 - Release PTT control:
   - `stopPushToTalk()` closes socket and releases audio resources.
+  - Ward stops muting this guardian's audio stream.
 
 4) Stop/cleanup
 - On Back or screen exit:
@@ -211,6 +215,10 @@ Add analytics or logs
 - Added comprehensive exception handling in connection monitor to prevent crashes when WiFi disconnects or guardian exits.
 - Connection monitor now safely checks socket state and handles InterruptedException and other exceptions gracefully.
 - Audio playback error handlers now update UI state (`isConnectedToWard`) immediately when connection is lost.
+- Fixed crashes when exiting ward mode by improving thread safety and exception handling:
+  - Server sockets closed before client sockets to prevent new connections during shutdown.
+  - Proper synchronization when clearing client socket lists.
+  - Safe cleanup of PTT server resources.
 
 ### Default volume
 - Changed default audio volume from 50% (0.5f) to 100% (1.0f) for better out-of-the-box experience.
@@ -227,6 +235,20 @@ Add analytics or logs
   - Updates `isConnectedToWard` state immediately when connection is lost (timeout, socket errors, network disconnects).
   - Status turns red when connection drops and green when connection is active.
   - State updates happen in all error paths (connection monitor, audio playback, socket exceptions).
+  - Connection monitor checks socket state every second and updates status instantly when disconnected.
+
+### Guardian mode resilience
+- Guardian mode now stays active when WiFi disconnects - app remains on GuardianConnected screen waiting for reconnection.
+- Auto-reconnect feature: When connection drops, guardian automatically attempts to reconnect every 5 seconds.
+- Reconnection attempts continue until user manually exits guardian mode or connection is restored.
+- Connection state updates immediately on disconnect, not after timeout period.
+
+### Per-guardian PTT muting
+- Push-to-talk now only mutes the specific guardian sending PTT, not all guardians.
+- Other guardians can hear the PTT audio as feedback, enabling multi-guardian communication.
+- PTT audio is broadcast to all other guardians while muting only the sender's ward audio stream.
+- Uses synchronized set (`pttActiveSockets`) to track which guardian sockets are actively sending PTT.
+
 
 ## Operational runbook
 

@@ -101,6 +101,7 @@ class MainActivity : ComponentActivity() {
     private var guardianSocket: Socket? = null
     private var isPlayingAudio = false
     private var isPttReceiving = false
+    private val pttActiveSockets = mutableSetOf<Socket>() // Track which guardian sockets are sending PTT
     private val localIpAddress = mutableStateOf("")
     private var foregroundService: ForegroundService? = null
     private var serviceBound = false
@@ -113,7 +114,10 @@ class MainActivity : ComponentActivity() {
     private var pttAudioRecord: AudioRecord? = null
     private var isPttActive = mutableStateOf(false)
     private var connectedWardIp = mutableStateOf<String?>(null)
+    private var connectedWardNameState = mutableStateOf<String?>(null)
     private var isConnectedToWard = mutableStateOf(false)
+    private var shouldAutoReconnect = false
+    private var reconnectThread: Thread? = null
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -198,6 +202,7 @@ class MainActivity : ComponentActivity() {
                             stopPushToTalk()
                         },
                         onBack = {
+                            shouldAutoReconnect = false
                             stopAudioPlayback()
                             stopForegroundService()
                             currentScreen.value = Screen.Main
@@ -400,8 +405,11 @@ class MainActivity : ComponentActivity() {
 
                         thread {
                             try {
-                                isPttReceiving = true  // Mute ward's mic during PTT
-                                Log.d(TAG, "Ward microphone muted for PTT")
+                                // Track this socket as sending PTT
+                                synchronized(pttActiveSockets) {
+                                    pttActiveSockets.add(socket)
+                                }
+                                Log.d(TAG, "PTT client connected, muting ward mic for this guardian only")
 
                                 val bufferSize = AudioTrack.getMinBufferSize(
                                     SAMPLE_RATE,
@@ -426,12 +434,29 @@ class MainActivity : ComponentActivity() {
                                     val bytesRead = inputStream.read(buffer)
                                     if (bytesRead == -1) break
                                     pttAudioTrack?.write(buffer, 0, bytesRead)
+                                    
+                                    // Broadcast PTT audio to all OTHER guardians (feedback)
+                                    synchronized(clientSockets) {
+                                        clientSockets.forEach { guardianSocket ->
+                                            if (guardianSocket != socket && !guardianSocket.isClosed && guardianSocket.isConnected) {
+                                                try {
+                                                    guardianSocket.getOutputStream().write(buffer, 0, bytesRead)
+                                                    guardianSocket.getOutputStream().flush()
+                                                } catch (e: Exception) {
+                                                    Log.e(TAG, "Failed to send PTT feedback to guardian: ${e.message}")
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             } catch (e: Exception) {
                                 Log.e(TAG, "PTT playback error: ${e.message}")
                             } finally {
-                                isPttReceiving = false  // Unmute ward's mic
-                                Log.d(TAG, "Ward microphone unmuted")
+                                // Remove this socket from PTT active set
+                                synchronized(pttActiveSockets) {
+                                    pttActiveSockets.remove(socket)
+                                }
+                                Log.d(TAG, "PTT client disconnected, unmuting ward mic for this guardian")
 
                                 pttAudioTrack?.stop()
                                 pttAudioTrack?.release()
@@ -633,48 +658,51 @@ class MainActivity : ComponentActivity() {
                 while (isStreaming) {
                     val bytesRead = audioRecord?.read(buffer, 0, bufferSize) ?: 0
                     if (bytesRead > 0) {
-                        // Skip broadcasting if PTT is active (to prevent feedback)
-                        if (!isPttReceiving) {
-                            // Amplify audio before sending
-                            amplifyAudio(buffer, bytesRead, 3.5f)
+                        // Amplify audio before sending
+                        amplifyAudio(buffer, bytesRead, 3.5f)
 
-                            // Broadcast to all connected guardians
-                            val toRemove = mutableListOf<Socket>()
-                            // Take a snapshot to avoid ConcurrentModification and to skip sockets already closed
-                            val snapshot: List<Socket> = synchronized(clientSockets) { clientSockets.toList() }
-                            snapshot.forEach { s ->
-                                try {
-                                    if (s.isClosed || !s.isConnected) {
-                                        toRemove.add(s)
-                                    } else {
-                                        val out = s.getOutputStream()
-                                        out.write(buffer, 0, bytesRead)
-                                        out.flush()
-                                    }
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "Failed to write to guardian: ${e.message}")
+                        // Broadcast to all connected guardians, but skip those sending PTT
+                        val toRemove = mutableListOf<Socket>()
+                        val pttActive: Set<Socket>
+                        synchronized(pttActiveSockets) {
+                            pttActive = pttActiveSockets.toSet()
+                        }
+                        
+                        // Take a snapshot to avoid ConcurrentModification and to skip sockets already closed
+                        val snapshot: List<Socket> = synchronized(clientSockets) { clientSockets.toList() }
+                        snapshot.forEach { s ->
+                            try {
+                                if (s.isClosed || !s.isConnected) {
                                     toRemove.add(s)
+                                } else if (!pttActive.contains(s)) {
+                                    // Only send to guardians NOT currently sending PTT
+                                    val out = s.getOutputStream()
+                                    out.write(buffer, 0, bytesRead)
+                                    out.flush()
                                 }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Failed to write to guardian: ${e.message}")
+                                toRemove.add(s)
                             }
-                            if (toRemove.isNotEmpty()) {
-                                synchronized(clientSockets) {
-                                    toRemove.forEach { sock ->
-                                        clientSockets.remove(sock)
-                                        try {
-                                            sock.close()
-                                        } catch (_: Exception) {
-                                        }
+                        }
+                        if (toRemove.isNotEmpty()) {
+                            synchronized(clientSockets) {
+                                toRemove.forEach { sock ->
+                                    clientSockets.remove(sock)
+                                    try {
+                                        sock.close()
+                                    } catch (_: Exception) {
                                     }
                                 }
-                                runOnUiThread {
-                                    toRemove.forEach { sock ->
-                                        connectedGuardians.removeAll { it.socket == sock }
-                                    }
+                            }
+                            synchronized(pttActiveSockets) {
+                                pttActiveSockets.removeAll(toRemove)
+                            }
+                            runOnUiThread {
+                                toRemove.forEach { sock ->
+                                    connectedGuardians.removeAll { it.socket == sock }
                                 }
                             }
-                        } else {
-                            // PTT is active, just consume the buffer without sending
-                            Thread.sleep(10)
                         }
                     }
                 }
@@ -741,31 +769,67 @@ class MainActivity : ComponentActivity() {
             Log.d(TAG, "stopAudioBroadcast: already stopped")
             return
         }
+        
+        Log.d(TAG, "Stopping audio broadcast...")
         isStreaming = false
 
-        // Close all client sockets first (shutdown IO defensively)
-        synchronized(clientSockets) {
-            clientSockets.forEach { s ->
+        // Close server sockets first to stop accepting new connections
+        try {
+            val ss = serverSocket
+            if (ss != null && !ss.isClosed) {
                 try {
-                    if (!s.isClosed) {
-                        try {
-                            s.shutdownInput()
-                        } catch (_: Exception) {
-                        }
-                        try {
-                            s.shutdownOutput()
-                        } catch (_: Exception) {
-                        }
-                    }
-                } catch (_: Exception) {
-                } finally {
+                    ss.close()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error closing server socket: ${e.message}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error accessing server socket: ${e.message}")
+        } finally {
+            serverSocket = null
+        }
+
+        try {
+            val ps = pttServerSocket
+            if (ps != null && !ps.isClosed) {
+                try {
+                    ps.close()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error closing PTT server socket: ${e.message}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error accessing PTT server socket: ${e.message}")
+        } finally {
+            pttServerSocket = null
+        }
+
+        // Close all client sockets first (shutdown IO defensively)
+        val socketsToClose: List<Socket>
+        synchronized(clientSockets) {
+            socketsToClose = clientSockets.toList()
+            clientSockets.clear()
+        }
+        
+        socketsToClose.forEach { s ->
+            try {
+                if (!s.isClosed) {
                     try {
-                        s.close()
+                        s.shutdownInput()
+                    } catch (_: Exception) {
+                    }
+                    try {
+                        s.shutdownOutput()
                     } catch (_: Exception) {
                     }
                 }
+            } catch (_: Exception) {
+            } finally {
+                try {
+                    s.close()
+                } catch (_: Exception) {
+                }
             }
-            clientSockets.clear()
         }
 
         // Give audio thread time to finish
@@ -796,29 +860,7 @@ class MainActivity : ComponentActivity() {
             Log.e(TAG, "Error releasing PTT audio: ${e.message}")
         }
         pttAudioTrack = null
-
-        // Close server sockets
-        try {
-            val ss = serverSocket
-            if (ss != null && !ss.isClosed) {
-                ss.close()
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error closing server socket: ${e.message}")
-        } finally {
-            serverSocket = null
-        }
-
-        try {
-            val ps = pttServerSocket
-            if (ps != null && !ps.isClosed) {
-                ps.close()
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error closing PTT server socket: ${e.message}")
-        } finally {
-            pttServerSocket = null
-        }
+        isPttReceiving = false
 
         // Clear UI state
         runOnUiThread {
@@ -942,6 +984,12 @@ class MainActivity : ComponentActivity() {
     }
 
     internal fun connectToWardByIp(ipAddress: String, wardName: String?) {
+        // Don't attempt connection if already connected or connecting
+        if (isConnectedToWard.value || isPlayingAudio) {
+            Log.d(TAG, "Already connected or connecting, skipping connection attempt")
+            return
+        }
+        
         startForegroundService("Guardian Active", "Connecting to ward...")
         stopDiscovery()
 
@@ -958,8 +1006,10 @@ class MainActivity : ComponentActivity() {
                 val displayName = wardName ?: ipAddress
                 runOnUiThread {
                     connectedWardName.value = displayName
+                    connectedWardNameState.value = displayName
                     connectedWardIp.value = ipAddress
                     isConnectedToWard.value = true
+                    shouldAutoReconnect = false
                     currentScreen.value = Screen.GuardianConnected(displayName)
                 }
 
@@ -968,7 +1018,10 @@ class MainActivity : ComponentActivity() {
                 Log.e(TAG, "Connection error: ${e.message}")
                 runOnUiThread {
                     isConnectedToWard.value = false
-                    stopForegroundService()
+                    // Don't stop foreground service if we're in auto-reconnect mode
+                    if (!shouldAutoReconnect) {
+                        stopForegroundService()
+                    }
                 }
             }
         }
@@ -983,28 +1036,37 @@ class MainActivity : ComponentActivity() {
             try {
                 while (isMonitoringConnection) {
                     try {
-                        // Check if socket is still valid
+                        // Check if socket is still valid - update status immediately if disconnected
                         if (socket.isClosed || !socket.isConnected) {
                             Log.d(TAG, "Socket closed or disconnected in monitor")
+                            runOnUiThread {
+                                isConnectedToWard.value = false
+                            }
+                            if (!alertShown) {
+                                alertShown = true
+                                showConnectionLostAlert()
+                            }
                             break
                         }
                         Thread.sleep(1000)
                         val timeSinceLastData = System.currentTimeMillis() - lastConnectionTime
 
-                        if (timeSinceLastData > CONNECTION_TIMEOUT_MS && !alertShown) {
-                            // Connection lost for more than 30 seconds
-                            alertShown = true
+                        if (timeSinceLastData > CONNECTION_TIMEOUT_MS) {
+                            // Connection lost for more than timeout - update status immediately
                             runOnUiThread {
                                 isConnectedToWard.value = false
                             }
-                            showConnectionLostAlert()
+                            if (!alertShown) {
+                                alertShown = true
+                                showConnectionLostAlert()
+                            }
                         }
                     } catch (e: InterruptedException) {
                         Log.d(TAG, "Connection monitor interrupted")
                         break
                     } catch (e: Exception) {
                         Log.e(TAG, "Error in connection monitor: ${e.message}")
-                        // Connection likely lost, update UI state
+                        // Connection likely lost, update UI state immediately
                         runOnUiThread {
                             isConnectedToWard.value = false
                         }
@@ -1156,13 +1218,15 @@ class MainActivity : ComponentActivity() {
                         runOnUiThread {
                             isConnectedToWard.value = false
                         }
+                        // Don't break - let it fall through to cleanup and reconnect
                         break
                     } catch (e: java.io.IOException) {
                         // IO error, connection lost
-                        Log.d(TAG, "Connection lost during playback")
+                        Log.d(TAG, "Connection lost during playback: ${e.message}")
                         runOnUiThread {
                             isConnectedToWard.value = false
                         }
+                        // Don't break - let it fall through to cleanup and reconnect
                         break
                     } catch (e: Exception) {
                         Log.e(TAG, "Unexpected error during playback: ${e.message}")
@@ -1204,13 +1268,24 @@ class MainActivity : ComponentActivity() {
                 guardianSocket = null
 
                 runOnUiThread {
-                    if (currentScreen.value is Screen.GuardianConnected) {
-                        currentScreen.value = Screen.Guardian
-                        startDiscovery()
-                    }
                     isConnectedToWard.value = false
                     isPttActive.value = false
-                    stopForegroundService()
+                    
+                    // If we're still on GuardianConnected screen, start auto-reconnect
+                    if (currentScreen.value is Screen.GuardianConnected) {
+                        val wardIp = connectedWardIp.value
+                        val wardName = connectedWardNameState.value
+                        if (wardIp != null) {
+                            shouldAutoReconnect = true
+                            startAutoReconnect(wardIp, wardName)
+                        } else {
+                            // No ward IP, go back to discovery
+                            currentScreen.value = Screen.Guardian
+                            startDiscovery()
+                        }
+                    } else {
+                        stopForegroundService()
+                    }
                 }
             }
         }
@@ -1317,8 +1392,48 @@ class MainActivity : ComponentActivity() {
         pttSocket = null
     }
 
+    private fun startAutoReconnect(wardIp: String, wardName: String?) {
+        shouldAutoReconnect = true
+        reconnectThread?.interrupt()
+        
+        reconnectThread = thread {
+            while (shouldAutoReconnect && !Thread.currentThread().isInterrupted) {
+                try {
+                    Thread.sleep(5000) // Wait 5 seconds between reconnect attempts
+                    
+                    if (!shouldAutoReconnect) break
+                    
+                    Log.d(TAG, "Attempting to reconnect to ward at $wardIp")
+                    runOnUiThread {
+                        if (currentScreen.value is Screen.GuardianConnected) {
+                            connectToWardByIp(wardIp, wardName)
+                        } else {
+                            shouldAutoReconnect = false
+                        }
+                    }
+                    
+                    // Wait a bit to see if connection succeeded
+                    Thread.sleep(2000)
+                    if (isConnectedToWard.value) {
+                        Log.d(TAG, "Reconnection successful")
+                        shouldAutoReconnect = false
+                        break
+                    }
+                } catch (e: InterruptedException) {
+                    Log.d(TAG, "Reconnect thread interrupted")
+                    break
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error in reconnect thread: ${e.message}")
+                }
+            }
+        }
+    }
+
     private fun stopAudioPlayback() {
         isPlayingAudio = false
+        shouldAutoReconnect = false
+        reconnectThread?.interrupt()
+        reconnectThread = null
         stopConnectionMonitor()
         stopPushToTalk()
 
