@@ -47,12 +47,12 @@ fun GuardianScreen(
     onDeviceConnect: (String) -> Unit
 ) {
     val activity = LocalContext.current as? MainActivity
-    val showDialog = remember { mutableStateOf(false) }
     val showManualConnectDialog = remember { mutableStateOf(false) }
     val manualIpAddress = remember { mutableStateOf("") }
 
+    // No confirmation dialog needed when just browsing devices - go back directly
     BackHandler {
-        showDialog.value = true
+        onBack()
     }
 
     Column(
@@ -68,7 +68,7 @@ fun GuardianScreen(
                 .background(Color(0xFF2C5F8D))
         ) {
             IconButton(
-                onClick = { showDialog.value = true },
+                onClick = { onBack() },
                 modifier = Modifier
                     .align(Alignment.BottomStart)
                     .padding(start = 8.dp, bottom = 8.dp)
@@ -196,36 +196,6 @@ fun GuardianScreen(
                     }
                 ) {
                     Text("Cancel")
-                }
-            }
-        )
-    }
-
-    // Confirmation Dialog
-    if (showDialog.value) {
-        AlertDialog(
-            onDismissRequest = { showDialog.value = false },
-            title = {
-                Text(text = "Exit Guardian?")
-            },
-            text = {
-                Text(text = "Are you sure you want to go back to the main screen?")
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showDialog.value = false
-                        onBack()
-                    }
-                ) {
-                    Text("Yes")
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = { showDialog.value = false }
-                ) {
-                    Text("No")
                 }
             }
         )

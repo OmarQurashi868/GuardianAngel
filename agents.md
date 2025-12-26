@@ -236,18 +236,33 @@ Add analytics or logs
   - Status turns red when connection drops and green when connection is active.
   - State updates happen in all error paths (connection monitor, audio playback, socket exceptions).
   - Connection monitor checks socket state every second and updates status instantly when disconnected.
+  - Status updates within 3 seconds of data loss (before the full 30-second timeout for alert).
+  - Socket read timeout (5 seconds) enables faster detection of ward disconnection.
 
 ### Guardian mode resilience
 - Guardian mode now stays active when WiFi disconnects - app remains on GuardianConnected screen waiting for reconnection.
 - Auto-reconnect feature: When connection drops, guardian automatically attempts to reconnect every 5 seconds.
 - Reconnection attempts continue until user manually exits guardian mode or connection is restored.
 - Connection state updates immediately on disconnect, not after timeout period.
+- Reconnect properly re-establishes audio streams after successful connection.
+- Existing connections cleaned up before reconnection attempts to prevent resource leaks.
+- Connection timeout of 10 seconds for reconnection attempts.
 
 ### Per-guardian PTT muting
 - Push-to-talk now only mutes the specific guardian sending PTT, not all guardians.
 - Other guardians can hear the PTT audio as feedback, enabling multi-guardian communication.
 - PTT audio is broadcast to all other guardians while muting only the sender's ward audio stream.
 - Uses synchronized set (`pttActiveSockets`) to track which guardian sockets are actively sending PTT.
+
+### Ward mode stability
+- Fixed crashes when exiting ward mode after guardian connections.
+- Guardian disconnect now properly removes from connected list (uses IP address for reliable matching).
+- Reconnecting guardians automatically clean up old socket connections to prevent duplicates.
+- Socket monitoring properly exits when ward stops streaming.
+- PTT active sockets cleaned up when guardian disconnects.
+
+### UX improvements
+- Guardian device selection screen (GuardianScreen) no longer shows confirmation dialog on back - only the connected screen requires confirmation to disconnect.
 
 
 ## Operational runbook

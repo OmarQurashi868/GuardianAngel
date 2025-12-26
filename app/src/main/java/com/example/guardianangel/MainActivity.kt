@@ -543,13 +543,25 @@ class MainActivity : ComponentActivity() {
                                 }
 
                                 val connection = GuardianConnection(guardianName, guardianIp, socket)
+                                
+                                // Remove any existing connection with same IP (handles reconnection)
+                                val oldSockets = mutableListOf<Socket>()
                                 runOnUiThread {
-                                    // Check for existing connection with same IP and remove it
+                                    connectedGuardians.filter { it.ipAddress == guardianIp }.forEach { old ->
+                                        oldSockets.add(old.socket)
+                                    }
                                     connectedGuardians.removeAll { it.ipAddress == guardianIp }
                                     connectedGuardians.add(connection)
                                 }
-
+                                
+                                // Close old sockets and remove from client list
                                 synchronized(clientSockets) {
+                                    oldSockets.forEach { oldSocket ->
+                                        clientSockets.remove(oldSocket)
+                                        try {
+                                            if (!oldSocket.isClosed) oldSocket.close()
+                                        } catch (_: Exception) {}
+                                    }
                                     clientSockets.add(socket)
                                 }
 
@@ -719,6 +731,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun monitorConnection(socket: Socket, guardianName: String) {
+        val guardianIp = try { socket.inetAddress?.hostAddress } catch (_: Exception) { null }
+        
         thread {
             try {
                 val inputStream = socket.getInputStream()
@@ -726,39 +740,52 @@ class MainActivity : ComponentActivity() {
                 socket.soTimeout = 5000 // 5 second timeout
 
                 // Continuously monitor the socket
-                while (!socket.isClosed && socket.isConnected && !Thread.currentThread().isInterrupted) {
+                while (!socket.isClosed && socket.isConnected && !Thread.currentThread().isInterrupted && isStreaming) {
                     // Try to read 1 byte with timeout to detect disconnection
                     try {
-                        /* timeout set once above */
                         val read = inputStream.read(buffer, 0, 1)
                         if (read == -1) {
                             // Connection closed by remote
+                            Log.d(TAG, "Guardian $guardianName connection closed (EOF)")
                             break
                         }
                     } catch (e: java.net.SocketTimeoutException) {
                         // Timeout is expected, continue monitoring
                         continue
+                    } catch (e: java.net.SocketException) {
+                        // Socket exception means connection is broken
+                        Log.d(TAG, "Guardian $guardianName socket error: ${e.message}")
+                        break
                     } catch (e: Exception) {
                         // Any other exception means connection is broken
-                        Log.d(TAG, "Connection lost: ${e.message}")
+                        Log.d(TAG, "Guardian $guardianName connection lost: ${e.message}")
                         break
                     }
                 }
             } catch (e: Exception) {
-                Log.d(TAG, "Connection monitoring ended: ${e.message}")
+                Log.d(TAG, "Connection monitoring ended for $guardianName: ${e.message}")
             } finally {
-                // Clean up this connection
+                // Clean up this connection - use IP address for more reliable matching
+                Log.d(TAG, "Cleaning up guardian $guardianName (IP: $guardianIp)")
+                
                 synchronized(clientSockets) {
                     clientSockets.remove(socket)
                 }
+                synchronized(pttActiveSockets) {
+                    pttActiveSockets.remove(socket)
+                }
+                
                 runOnUiThread {
-                    connectedGuardians.removeAll { it.socket == socket }
+                    // Remove by both socket reference AND IP address to be thorough
+                    connectedGuardians.removeAll { it.socket == socket || it.ipAddress == guardianIp }
                 }
+                
                 try {
-                    socket.close()
+                    if (!socket.isClosed) socket.close()
                 } catch (e: Exception) {
+                    Log.d(TAG, "Error closing socket: ${e.message}")
                 }
-                Log.d(TAG, "Guardian $guardianName disconnected")
+                Log.d(TAG, "Guardian $guardianName disconnected and cleaned up")
             }
         }
     }
@@ -984,10 +1011,21 @@ class MainActivity : ComponentActivity() {
     }
 
     internal fun connectToWardByIp(ipAddress: String, wardName: String?) {
-        // Don't attempt connection if already connected or connecting
-        if (isConnectedToWard.value || isPlayingAudio) {
-            Log.d(TAG, "Already connected or connecting, skipping connection attempt")
+        // Don't attempt connection if already connected and playing
+        if (isConnectedToWard.value && isPlayingAudio) {
+            Log.d(TAG, "Already connected and playing, skipping connection attempt")
             return
+        }
+        
+        // Clean up any existing connection before attempting new one
+        if (isPlayingAudio || guardianSocket != null) {
+            Log.d(TAG, "Cleaning up existing connection before reconnect")
+            isPlayingAudio = false
+            try { guardianSocket?.close() } catch (_: Exception) {}
+            guardianSocket = null
+            try { audioTrack?.stop() } catch (_: Exception) {}
+            try { audioTrack?.release() } catch (_: Exception) {}
+            audioTrack = null
         }
         
         startForegroundService("Guardian Active", "Connecting to ward...")
@@ -995,7 +1033,9 @@ class MainActivity : ComponentActivity() {
 
         thread {
             try {
-                val socket = Socket(ipAddress, AUDIO_PORT)
+                Log.d(TAG, "Attempting to connect to ward at $ipAddress:$AUDIO_PORT")
+                val socket = Socket()
+                socket.connect(java.net.InetSocketAddress(ipAddress, AUDIO_PORT), 10000) // 10 second timeout
                 Log.d(TAG, "Connected to ward at $ipAddress:$AUDIO_PORT")
 
                 // Send device name to ward
@@ -1010,6 +1050,8 @@ class MainActivity : ComponentActivity() {
                     connectedWardIp.value = ipAddress
                     isConnectedToWard.value = true
                     shouldAutoReconnect = false
+                    reconnectThread?.interrupt()
+                    reconnectThread = null
                     currentScreen.value = Screen.GuardianConnected(displayName)
                 }
 
@@ -1019,7 +1061,7 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread {
                     isConnectedToWard.value = false
                     // Don't stop foreground service if we're in auto-reconnect mode
-                    if (!shouldAutoReconnect) {
+                    if (!shouldAutoReconnect && currentScreen.value !is Screen.GuardianConnected) {
                         stopForegroundService()
                     }
                 }
@@ -1033,14 +1075,19 @@ class MainActivity : ComponentActivity() {
 
         connectionMonitorThread = thread {
             var alertShown = false
+            var statusUpdatedToDisconnected = false
+            
             try {
                 while (isMonitoringConnection) {
                     try {
                         // Check if socket is still valid - update status immediately if disconnected
                         if (socket.isClosed || !socket.isConnected) {
                             Log.d(TAG, "Socket closed or disconnected in monitor")
-                            runOnUiThread {
-                                isConnectedToWard.value = false
+                            if (!statusUpdatedToDisconnected) {
+                                statusUpdatedToDisconnected = true
+                                runOnUiThread {
+                                    isConnectedToWard.value = false
+                                }
                             }
                             if (!alertShown) {
                                 alertShown = true
@@ -1048,18 +1095,32 @@ class MainActivity : ComponentActivity() {
                             }
                             break
                         }
+                        
                         Thread.sleep(1000)
                         val timeSinceLastData = System.currentTimeMillis() - lastConnectionTime
 
-                        if (timeSinceLastData > CONNECTION_TIMEOUT_MS) {
-                            // Connection lost for more than timeout - update status immediately
+                        // Update status immediately if no data received for more than 3 seconds
+                        // (indicates ward is likely disconnected)
+                        if (timeSinceLastData > 3000 && !statusUpdatedToDisconnected) {
+                            Log.d(TAG, "No data received for ${timeSinceLastData}ms, marking as disconnected")
+                            statusUpdatedToDisconnected = true
                             runOnUiThread {
                                 isConnectedToWard.value = false
                             }
-                            if (!alertShown) {
-                                alertShown = true
-                                showConnectionLostAlert()
+                        }
+                        
+                        // Reset status if we start receiving data again
+                        if (timeSinceLastData < 2000 && statusUpdatedToDisconnected && !alertShown) {
+                            statusUpdatedToDisconnected = false
+                            runOnUiThread {
+                                isConnectedToWard.value = true
                             }
+                        }
+
+                        // Show alert after full timeout
+                        if (timeSinceLastData > CONNECTION_TIMEOUT_MS && !alertShown) {
+                            alertShown = true
+                            showConnectionLostAlert()
                         }
                     } catch (e: InterruptedException) {
                         Log.d(TAG, "Connection monitor interrupted")
@@ -1067,8 +1128,11 @@ class MainActivity : ComponentActivity() {
                     } catch (e: Exception) {
                         Log.e(TAG, "Error in connection monitor: ${e.message}")
                         // Connection likely lost, update UI state immediately
-                        runOnUiThread {
-                            isConnectedToWard.value = false
+                        if (!statusUpdatedToDisconnected) {
+                            statusUpdatedToDisconnected = true
+                            runOnUiThread {
+                                isConnectedToWard.value = false
+                            }
                         }
                         if (!alertShown) {
                             alertShown = true
@@ -1157,6 +1221,14 @@ class MainActivity : ComponentActivity() {
     private fun startAudioPlayback(inputStream: InputStream, socket: Socket) {
         guardianSocket = socket
         isPlayingAudio = true
+        
+        // Set socket timeout to detect disconnection faster
+        try {
+            socket.soTimeout = 5000 // 5 second read timeout
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to set socket timeout: ${e.message}")
+        }
+        
         startConnectionMonitor(socket)
 
         thread {
@@ -1189,6 +1261,7 @@ class MainActivity : ComponentActivity() {
                 }
                 audioTrack?.play()
                 val buffer = ByteArray(bufferSize)
+                var consecutiveTimeouts = 0
 
                 while (
                     isPlayingAudio &&
@@ -1198,7 +1271,20 @@ class MainActivity : ComponentActivity() {
                 ) {
                     try {
                         val bytesRead = inputStream.read(buffer)
-                        if (bytesRead <= 0) continue
+                        if (bytesRead <= 0) {
+                            // EOF or no data - connection likely closed
+                            if (bytesRead == -1) {
+                                Log.d(TAG, "End of stream (EOF) received")
+                                runOnUiThread {
+                                    isConnectedToWard.value = false
+                                }
+                                break
+                            }
+                            continue
+                        }
+                        
+                        // Reset timeout counter on successful read
+                        consecutiveTimeouts = 0
                         // Update last connection time when data is received
                         lastConnectionTime = System.currentTimeMillis()
                         val track = audioTrack
@@ -1212,13 +1298,24 @@ class MainActivity : ComponentActivity() {
                             Log.e(TAG, "AudioTrack write failed: ${e.message}")
                             break
                         }
+                    } catch (e: java.net.SocketTimeoutException) {
+                        // Read timeout - data stopped coming
+                        consecutiveTimeouts++
+                        Log.d(TAG, "Socket read timeout #$consecutiveTimeouts")
+                        // Update UI to show disconnected if we've had multiple timeouts
+                        if (consecutiveTimeouts >= 2) {
+                            runOnUiThread {
+                                isConnectedToWard.value = false
+                            }
+                        }
+                        // Continue trying to read - the connection monitor will handle alert
+                        continue
                     } catch (e: java.net.SocketException) {
                         // Socket closed, exit gracefully
                         Log.d(TAG, "Socket closed during playback")
                         runOnUiThread {
                             isConnectedToWard.value = false
                         }
-                        // Don't break - let it fall through to cleanup and reconnect
                         break
                     } catch (e: java.io.IOException) {
                         // IO error, connection lost
@@ -1226,7 +1323,6 @@ class MainActivity : ComponentActivity() {
                         runOnUiThread {
                             isConnectedToWard.value = false
                         }
-                        // Don't break - let it fall through to cleanup and reconnect
                         break
                     } catch (e: Exception) {
                         Log.e(TAG, "Unexpected error during playback: ${e.message}")
@@ -1393,32 +1489,67 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startAutoReconnect(wardIp: String, wardName: String?) {
+        // Don't start multiple reconnect threads
+        if (shouldAutoReconnect && reconnectThread?.isAlive == true) {
+            Log.d(TAG, "Reconnect thread already running")
+            return
+        }
+        
         shouldAutoReconnect = true
         reconnectThread?.interrupt()
         
         reconnectThread = thread {
+            var attemptCount = 0
             while (shouldAutoReconnect && !Thread.currentThread().isInterrupted) {
                 try {
-                    Thread.sleep(5000) // Wait 5 seconds between reconnect attempts
+                    attemptCount++
+                    Log.d(TAG, "Reconnect attempt #$attemptCount to ward at $wardIp")
                     
-                    if (!shouldAutoReconnect) break
-                    
-                    Log.d(TAG, "Attempting to reconnect to ward at $wardIp")
-                    runOnUiThread {
-                        if (currentScreen.value is Screen.GuardianConnected) {
-                            connectToWardByIp(wardIp, wardName)
-                        } else {
-                            shouldAutoReconnect = false
-                        }
+                    // Don't wait on first attempt
+                    if (attemptCount > 1) {
+                        Thread.sleep(5000) // Wait 5 seconds between reconnect attempts
                     }
                     
-                    // Wait a bit to see if connection succeeded
-                    Thread.sleep(2000)
-                    if (isConnectedToWard.value) {
-                        Log.d(TAG, "Reconnection successful")
+                    if (!shouldAutoReconnect) break
+                    if (currentScreen.value !is Screen.GuardianConnected) {
+                        Log.d(TAG, "No longer on GuardianConnected screen, stopping reconnect")
                         shouldAutoReconnect = false
                         break
                     }
+                    
+                    // Attempt connection directly in this thread (not on UI thread)
+                    try {
+                        Log.d(TAG, "Attempting to connect to ward at $wardIp:$AUDIO_PORT")
+                        val socket = Socket()
+                        socket.connect(java.net.InetSocketAddress(wardIp, AUDIO_PORT), 10000)
+                        Log.d(TAG, "Reconnection successful to $wardIp:$AUDIO_PORT")
+                        
+                        // Send device name to ward
+                        val deviceName = Build.MODEL
+                        socket.getOutputStream().write(deviceName.toByteArray())
+                        socket.getOutputStream().flush()
+                        
+                        val displayName = wardName ?: wardIp
+                        runOnUiThread {
+                            connectedWardName.value = displayName
+                            connectedWardNameState.value = displayName
+                            connectedWardIp.value = wardIp
+                            isConnectedToWard.value = true
+                            shouldAutoReconnect = false
+                            cancelConnectionLostAlert()
+                        }
+                        
+                        // Start audio playback on this successful connection
+                        startAudioPlayback(socket.getInputStream(), socket)
+                        break // Exit reconnect loop on success
+                        
+                    } catch (e: Exception) {
+                        Log.d(TAG, "Reconnect attempt #$attemptCount failed: ${e.message}")
+                        runOnUiThread {
+                            isConnectedToWard.value = false
+                        }
+                    }
+                    
                 } catch (e: InterruptedException) {
                     Log.d(TAG, "Reconnect thread interrupted")
                     break
@@ -1426,6 +1557,7 @@ class MainActivity : ComponentActivity() {
                     Log.e(TAG, "Error in reconnect thread: ${e.message}")
                 }
             }
+            Log.d(TAG, "Reconnect thread exiting (shouldAutoReconnect=$shouldAutoReconnect)")
         }
     }
 
