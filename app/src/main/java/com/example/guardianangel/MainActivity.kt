@@ -17,6 +17,10 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.RingtoneManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
@@ -118,6 +122,9 @@ class MainActivity : ComponentActivity() {
     private var isConnectedToWard = mutableStateOf(false)
     private var shouldAutoReconnect = false
     private var reconnectThread: Thread? = null
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var isNetworkAvailable = mutableStateOf(true)
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -152,9 +159,11 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         nsdManager = getSystemService(NSD_SERVICE) as NsdManager
+        connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         createNotificationChannel()
         requestNotificationPermission()
         localIpAddress.value = getLocalIpAddress()
+        setupNetworkMonitoring()
 
         setContent {
             GuardianAngelTheme {
@@ -350,6 +359,10 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         try {
+            stopNetworkMonitoring()
+        } catch (_: Exception) {
+        }
+        try {
             if (serviceBound) {
                 unbindService(serviceConnection)
             }
@@ -371,6 +384,104 @@ class MainActivity : ComponentActivity() {
             stopForegroundService()
         } catch (_: Exception) {
         }
+    }
+    
+    private fun setupNetworkMonitoring() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            connectivityManager?.let { cm ->
+                networkCallback = object : ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: Network) {
+                        Log.d(TAG, "Network available")
+                        runOnUiThread {
+                            isNetworkAvailable.value = true
+                            updateWardNotification()
+                            updateGuardianNotification()
+                        }
+                    }
+
+                    override fun onLost(network: Network) {
+                        Log.d(TAG, "Network lost")
+                        runOnUiThread {
+                            isNetworkAvailable.value = false
+                            updateWardNotification()
+                            updateGuardianNotification()
+                        }
+                    }
+
+                    override fun onCapabilitiesChanged(
+                        network: Network,
+                        networkCapabilities: NetworkCapabilities
+                    ) {
+                        val hasInternet = networkCapabilities.hasCapability(
+                            NetworkCapabilities.NET_CAPABILITY_INTERNET
+                        ) && networkCapabilities.hasCapability(
+                            NetworkCapabilities.NET_CAPABILITY_VALIDATED
+                        )
+                        runOnUiThread {
+                            isNetworkAvailable.value = hasInternet
+                            updateWardNotification()
+                            updateGuardianNotification()
+                        }
+                    }
+                }
+
+                val request = NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .build()
+                cm.registerNetworkCallback(request, networkCallback!!)
+                
+                // Check initial network state
+                val activeNetwork = cm.activeNetwork
+                val capabilities = cm.getNetworkCapabilities(activeNetwork)
+                isNetworkAvailable.value = capabilities?.hasCapability(
+                    NetworkCapabilities.NET_CAPABILITY_INTERNET
+                ) == true && capabilities.hasCapability(
+                    NetworkCapabilities.NET_CAPABILITY_VALIDATED
+                )
+            }
+        } else {
+            // Fallback for older Android versions
+            @Suppress("DEPRECATION")
+            val activeNetworkInfo = connectivityManager?.activeNetworkInfo
+            isNetworkAvailable.value = activeNetworkInfo?.isConnected == true
+        }
+    }
+    
+    private fun stopNetworkMonitoring() {
+        networkCallback?.let { callback ->
+            try {
+                connectivityManager?.unregisterNetworkCallback(callback)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error unregistering network callback: ${e.message}")
+            }
+            networkCallback = null
+        }
+    }
+    
+    private fun updateWardNotification() {
+        if (currentScreen.value != Screen.Ward || !isStreaming) return
+        
+        synchronized(clientSockets) {
+            val guardianCount = clientSockets.size
+            val notificationText = when {
+                !isNetworkAvailable.value -> "Attempting to reconnect..."
+                guardianCount == 0 -> "Waiting for guardian..."
+                else -> "Broadcasting..."
+            }
+            startForegroundService("Ward Active", notificationText)
+        }
+    }
+    
+    private fun updateGuardianNotification() {
+        if (currentScreen.value !is Screen.GuardianConnected) return
+        
+        val notificationText = when {
+            !isNetworkAvailable.value -> "Attempting to reconnect..."
+            isConnectedToWard.value && isPlayingAudio -> "Monitoring ward..."
+            shouldAutoReconnect -> "Attempting to reconnect..."
+            else -> "Connecting to ward..."
+        }
+        startForegroundService("Guardian Active", notificationText)
     }
 
     private fun getLocalIpAddress(): String {
@@ -486,7 +597,7 @@ class MainActivity : ComponentActivity() {
         }
 
         val deviceName = Build.MODEL
-        startForegroundService("Ward Active", "Waiting for guardian connection...")
+        startForegroundService("Ward Active", "Waiting for guardian...")
 
         // Start PTT server
         startPttServer()
@@ -525,6 +636,11 @@ class MainActivity : ComponentActivity() {
 
                 // Wait for Guardian to connect
                 while (serverSocket != null && !serverSocket!!.isClosed) {
+                    // Update notification based on guardian count and network state
+                    runOnUiThread {
+                        updateWardNotification()
+                    }
+                    
                     val client = serverSocket?.accept()
                     client?.let { socket ->
                         val guardianIp = socket.inetAddress.hostAddress ?: "Unknown"
@@ -542,26 +658,48 @@ class MainActivity : ComponentActivity() {
                                     guardianIp
                                 }
 
-                                val connection = GuardianConnection(guardianName, guardianIp, socket)
-                                
-                                // Remove any existing connection with same IP (handles reconnection)
-                                val oldSockets = mutableListOf<Socket>()
-                                runOnUiThread {
-                                    connectedGuardians.filter { it.ipAddress == guardianIp }.forEach { old ->
-                                        oldSockets.add(old.socket)
-                                    }
-                                    connectedGuardians.removeAll { it.ipAddress == guardianIp }
-                                    connectedGuardians.add(connection)
-                                }
-                                
-                                // Close old sockets and remove from client list
+                                // First, check for and remove any stale guardians with the same IP
+                                val staleSockets = mutableListOf<Socket>()
                                 synchronized(clientSockets) {
-                                    oldSockets.forEach { oldSocket ->
-                                        clientSockets.remove(oldSocket)
+                                    // Find all sockets with same IP
+                                    clientSockets.filter { s ->
                                         try {
-                                            if (!oldSocket.isClosed) oldSocket.close()
+                                            s.inetAddress?.hostAddress == guardianIp && s != socket
+                                        } catch (_: Exception) { false }
+                                    }.forEach { staleSockets.add(it) }
+                                    
+                                    // Remove stale sockets from client list
+                                    staleSockets.forEach { staleSocket ->
+                                        clientSockets.remove(staleSocket)
+                                        try {
+                                            if (!staleSocket.isClosed) {
+                                                staleSocket.shutdownInput()
+                                                staleSocket.shutdownOutput()
+                                                staleSocket.close()
+                                            }
                                         } catch (_: Exception) {}
                                     }
+                                }
+                                
+                                // Remove stale guardian entries from UI
+                                runOnUiThread {
+                                    connectedGuardians.removeAll { it.ipAddress == guardianIp }
+                                }
+                                
+                                // Also remove from PTT active set
+                                synchronized(pttActiveSockets) {
+                                    staleSockets.forEach { pttActiveSockets.remove(it) }
+                                }
+                                
+                                // Now add the new connection
+                                val connection = GuardianConnection(guardianName, guardianIp, socket)
+                                runOnUiThread {
+                                    connectedGuardians.add(connection)
+                                    // Update notification when guardian connects
+                                    updateWardNotification()
+                                }
+                                
+                                synchronized(clientSockets) {
                                     clientSockets.add(socket)
                                 }
 
@@ -714,6 +852,7 @@ class MainActivity : ComponentActivity() {
                                 toRemove.forEach { sock ->
                                     connectedGuardians.removeAll { it.socket == sock }
                                 }
+                                    connectedGuardians.removeAll { it.socket.isClosed || !it.socket.isConnected }
                             }
                         }
                     }
@@ -734,6 +873,8 @@ class MainActivity : ComponentActivity() {
         val guardianIp = try { socket.inetAddress?.hostAddress } catch (_: Exception) { null }
         
         thread {
+            var lastSuccessfulRead = System.currentTimeMillis()
+            
             try {
                 val inputStream = socket.getInputStream()
                 val buffer = ByteArray(1)
@@ -749,8 +890,15 @@ class MainActivity : ComponentActivity() {
                             Log.d(TAG, "Guardian $guardianName connection closed (EOF)")
                             break
                         }
+                        // Successful read - update timestamp
+                        lastSuccessfulRead = System.currentTimeMillis()
                     } catch (e: java.net.SocketTimeoutException) {
-                        // Timeout is expected, continue monitoring
+                        // Timeout is expected - check if we've had no successful reads for 5 seconds
+                        val timeSinceLastRead = System.currentTimeMillis() - lastSuccessfulRead
+                        if (timeSinceLastRead >= 5000) {
+                            Log.d(TAG, "Guardian $guardianName no data for 5 seconds, removing")
+                            break
+                        }
                         continue
                     } catch (e: java.net.SocketException) {
                         // Socket exception means connection is broken
@@ -778,6 +926,8 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread {
                     // Remove by both socket reference AND IP address to be thorough
                     connectedGuardians.removeAll { it.socket == socket || it.ipAddress == guardianIp }
+                    // Update notification when guardian disconnects
+                    updateWardNotification()
                 }
                 
                 try {
@@ -837,6 +987,9 @@ class MainActivity : ComponentActivity() {
             socketsToClose = clientSockets.toList()
             clientSockets.clear()
         }
+        synchronized(pttActiveSockets) {
+            pttActiveSockets.clear()
+        }
         
         socketsToClose.forEach { s ->
             try {
@@ -857,6 +1010,11 @@ class MainActivity : ComponentActivity() {
                 } catch (_: Exception) {
                 }
             }
+        }
+        
+        // Ensure all guardian entries are removed from UI
+        runOnUiThread {
+            connectedGuardians.clear()
         }
 
         // Give audio thread time to finish
@@ -888,11 +1046,6 @@ class MainActivity : ComponentActivity() {
         }
         pttAudioTrack = null
         isPttReceiving = false
-
-        // Clear UI state
-        runOnUiThread {
-            connectedGuardians.clear()
-        }
 
         // Unregister NSD service (only if previously registered)
         val listener = registrationListener
@@ -1028,7 +1181,7 @@ class MainActivity : ComponentActivity() {
             audioTrack = null
         }
         
-        startForegroundService("Guardian Active", "Connecting to ward...")
+        updateGuardianNotification()
         stopDiscovery()
 
         thread {
@@ -1052,6 +1205,7 @@ class MainActivity : ComponentActivity() {
                     shouldAutoReconnect = false
                     reconnectThread?.interrupt()
                     reconnectThread = null
+                    updateGuardianNotification()
                     currentScreen.value = Screen.GuardianConnected(displayName)
                 }
 
@@ -1373,6 +1527,7 @@ class MainActivity : ComponentActivity() {
                         val wardName = connectedWardNameState.value
                         if (wardIp != null) {
                             shouldAutoReconnect = true
+                            updateGuardianNotification()
                             startAutoReconnect(wardIp, wardName)
                         } else {
                             // No ward IP, go back to discovery
@@ -1497,6 +1652,9 @@ class MainActivity : ComponentActivity() {
         
         shouldAutoReconnect = true
         reconnectThread?.interrupt()
+        runOnUiThread {
+            updateGuardianNotification()
+        }
         
         reconnectThread = thread {
             var attemptCount = 0
@@ -1537,6 +1695,7 @@ class MainActivity : ComponentActivity() {
                             isConnectedToWard.value = true
                             shouldAutoReconnect = false
                             cancelConnectionLostAlert()
+                            updateGuardianNotification()
                         }
                         
                         // Start audio playback on this successful connection

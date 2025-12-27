@@ -232,7 +232,7 @@ fun GuardianConnectedScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     val statusColor = if (isConnected) Color(0xFF00FF00) else Color(0xFFFF5555)
-                    val statusText = if (isConnected) "Audio streaming active" else "Connection DISCONNECTED"
+                    val statusText = if (isConnected) "Connected" else "DISCONNECTED"
                     Box(
                         modifier = Modifier
                             .width(12.dp)

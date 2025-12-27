@@ -229,6 +229,17 @@ Add analytics or logs
   - Activity configured with `showWhenLocked` and `turnScreenOn` attributes.
   - Full-screen intent properly configured with separate PendingIntent for maximum compatibility.
   - Notification uses high priority and alarm category to ensure visibility.
+- Foreground service notification text tracks the current role and health:
+  - Guardians see:
+    - "Monitoring ward..." when connected and streaming.
+    - "Attempting to reconnect..." when WiFi/network is disconnected OR when auto-reconnect loop is active.
+    - "Connecting to ward..." when initially connecting.
+  - Wards display:
+    - "Waiting for guardian..." when no guardians are connected but network is available.
+    - "Broadcasting..." when one or more guardians are connected.
+    - "Attempting to reconnect..." when network/WiFi is disconnected (detected via ConnectivityManager).
+  - All notification statuses end with "..." for consistency.
+  - Network connectivity is monitored using ConnectivityManager.NetworkCallback to detect WiFi/network disconnections for both guardian and ward roles.
 
 ### Status indicator
 - Status widget (green/red dot) now accurately reflects connection state:
@@ -238,6 +249,7 @@ Add analytics or logs
   - Connection monitor checks socket state every second and updates status instantly when disconnected.
   - Status updates within 3 seconds of data loss (before the full 30-second timeout for alert).
   - Socket read timeout (5 seconds) enables faster detection of ward disconnection.
+  - Status text now only reads `Connected` (capitalized) or `DISCONNECTED` so the indicator stays simple and consistent.
 
 ### Guardian mode resilience
 - Guardian mode now stays active when WiFi disconnects - app remains on GuardianConnected screen waiting for reconnection.
@@ -260,6 +272,10 @@ Add analytics or logs
 - Reconnecting guardians automatically clean up old socket connections to prevent duplicates.
 - Socket monitoring properly exits when ward stops streaming.
 - PTT active sockets cleaned up when guardian disconnects.
+- Stale guardian entries are pruned as soon as their sockets close, keeping the connected list accurate and allowing the Ward screen to exit cleanly even after multiple joins/disconnects.
+- Ward exit gracefully removes all guardian entries and sockets, including PTT active sockets.
+- Guardians are automatically removed after 5 seconds of no data/connection (timeout-based cleanup).
+- When a guardian attempts to connect, ward first checks for and removes all stale guardians with the same IP address, ensuring clean reconnection without duplicates.
 
 ### UX improvements
 - Guardian device selection screen (GuardianScreen) no longer shows confirmation dialog on back - only the connected screen requires confirmation to disconnect.
