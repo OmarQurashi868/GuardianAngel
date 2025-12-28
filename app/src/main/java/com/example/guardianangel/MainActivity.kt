@@ -1109,24 +1109,23 @@ class MainActivity : ComponentActivity() {
             synchronized(clientSockets) {
                 clientSockets.remove(socket)
             }
-                synchronized(pttActiveSockets) {
-                    pttActiveSockets.remove(socket)
-                }
-                
-                runOnUiThread {
-                    // Remove by both socket reference AND IP address to be thorough
-                    connectedGuardians.removeAll { it.socket == socket || it.ipAddress == guardianIp }
-                    // Update notification when guardian disconnects
-                    updateWardNotification()
-                }
-                
-                try {
-                    if (!socket.isClosed) socket.close()
-                } catch (e: Exception) {
-                    Log.d(TAG, "Error closing socket: ${e.message}")
-                }
-                Log.d(TAG, "Guardian $guardianName disconnected and cleaned up")
+            synchronized(pttActiveSockets) {
+                pttActiveSockets.remove(socket)
             }
+            
+            runOnUiThread {
+                // Remove by both socket reference AND IP address to be thorough
+                connectedGuardians.removeAll { it.socket == socket || it.ipAddress == guardianIp }
+                // Update notification when guardian disconnects
+                updateWardNotification()
+            }
+            
+            try {
+                if (!socket.isClosed) socket.close()
+            } catch (e: Exception) {
+                Log.d(TAG, "Error closing socket: ${e.message}")
+            }
+            Log.d(TAG, "Guardian $guardianName disconnected and cleaned up")
         }
     }
 
@@ -1370,8 +1369,9 @@ class MainActivity : ComponentActivity() {
 
     internal fun connectToWard(deviceName: String) {
         val serviceInfo = discoveredDevices.find { it.serviceName == deviceName }
-        serviceInfo?.let {
-            connectToWardByIp(it.host.hostAddress ?: "", deviceName)
+        serviceInfo?.let { info ->
+            val ipAddress = info.host?.hostAddress ?: ""
+            connectToWardByIp(ipAddress, deviceName)
         }
     }
 
