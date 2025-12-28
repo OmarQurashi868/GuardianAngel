@@ -37,9 +37,9 @@ Think of each functional concern as an agent (a cohesive unit with clear respons
   - TCP server on `Constants.PTT_PORT` for PTT audio uplink from guardian.
   - Registers itself with NSD as `_ward._tcp` named `ward_<device model>`.
 - Audio:
-  - Capture with `AudioRecord` using 44.1kHz mono PCM 16-bit.
-  - Applies a safety-limited gain before broadcasting.
-  - Plays back PTT audio via `AudioTrack` when a guardian PTT socket is connected; mutes its own broadcast capture while receiving PTT to prevent feedback.
+  - Capture with `AudioRecord` using 44.1kHz mono PCM 16-bit with `VOICE_COMMUNICATION` source for phone call quality (noise suppression, echo cancellation).
+  - Applies amplified gain (5.0x) before broadcasting for better pickup without requiring max volume on guardian side.
+  - Plays back PTT audio via `AudioTrack` when a guardian PTT socket is connected; amplifies PTT audio (4.0x gain) before playback; mutes its own broadcast capture while receiving PTT to prevent feedback.
 - Lifecycle:
   - Started from `WardScreen` (via `MainActivity.startBroadcasting()`).
   - Cleans up on exiting the screen or when stopped: closes sockets, stops audio capture and playback, unregisters NSD.
@@ -250,6 +250,7 @@ Add analytics or logs
   - Status updates within 3 seconds of data loss (before the full 30-second timeout for alert).
   - Socket read timeout (5 seconds) enables faster detection of ward disconnection.
   - Status text now only reads `Connected` (capitalized) or `DISCONNECTED` so the indicator stays simple and consistent.
+  - Fixed status widget flickering by adding debounce/hysteresis logic - status only updates after 2 seconds since last check to prevent rapid toggling when data arrives intermittently.
 
 ### Guardian mode resilience
 - Guardian mode now stays active when WiFi disconnects - app remains on GuardianConnected screen waiting for reconnection.
@@ -265,6 +266,10 @@ Add analytics or logs
 - Other guardians can hear the PTT audio as feedback, enabling multi-guardian communication.
 - PTT audio is broadcast to all other guardians while muting only the sender's ward audio stream.
 - Uses synchronized set (`pttActiveSockets`) to track which guardian sockets are actively sending PTT.
+- PTT feedback broadcasting moved to separate thread to prevent blocking and choppy audio.
+- PTT audio from guardian is amplified (4.0x gain) on ward's end before playback for better volume.
+- PTT feedback broadcasting moved to separate thread to prevent blocking and choppy audio.
+- PTT audio from guardian is amplified (4.0x gain) on ward's end before playback for better volume.
 
 ### Ward mode stability
 - Fixed crashes when exiting ward mode after guardian connections.
@@ -276,6 +281,15 @@ Add analytics or logs
 - Ward exit gracefully removes all guardian entries and sockets, including PTT active sockets.
 - Guardians are automatically removed after 5 seconds of no data/connection (timeout-based cleanup).
 - When a guardian attempts to connect, ward first checks for and removes all stale guardians with the same IP address, ensuring clean reconnection without duplicates.
+- Fixed ward exit crash by ensuring all monitorConnection threads and server accept thread are properly tracked and waited for before cleanup.
+- When ward loses network connection and reconnects, the server socket accept loop automatically restarts, allowing previously connected guardians to reconnect without requiring the ward to stop and restart its session.
+- Server socket accept loop handles network errors gracefully and restarts when network becomes available again (detected via ConnectivityManager.NetworkCallback).
+
+### Audio quality improvements
+- Ward audio capture now uses `VOICE_COMMUNICATION` audio source instead of `MIC` for phone call quality with built-in noise suppression and echo cancellation.
+- Ward audio gain increased from 3.5x to 5.0x for better pickup, allowing guardians to hear clearly without max volume.
+- PTT audio from guardian is amplified (4.0x gain) on ward's end before playback for better volume.
+- PTT feedback broadcasting moved to separate thread to prevent blocking and eliminate choppy audio on guardian side.
 
 ### UX improvements
 - Guardian device selection screen (GuardianScreen) no longer shows confirmation dialog on back - only the connected screen requires confirmation to disconnect.

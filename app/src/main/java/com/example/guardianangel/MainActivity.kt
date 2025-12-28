@@ -125,6 +125,8 @@ class MainActivity : ComponentActivity() {
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var isNetworkAvailable = mutableStateOf(true)
+    private var serverAcceptThread: Thread? = null
+    private var monitorConnectionThreads = mutableSetOf<Thread>()
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -396,6 +398,13 @@ class MainActivity : ComponentActivity() {
                             isNetworkAvailable.value = true
                             updateWardNotification()
                             updateGuardianNotification()
+                            
+                            // If we're in ward mode and server socket is closed, restart it
+                            if (isStreaming && (serverSocket == null || serverSocket!!.isClosed)) {
+                                Log.d(TAG, "Network restored, restarting ward server socket")
+                                // Restart the server accept loop
+                                restartWardServerSocket()
+                            }
                         }
                     }
 
@@ -540,21 +549,36 @@ class MainActivity : ComponentActivity() {
                                 pttAudioTrack?.play()
                                 val buffer = ByteArray(bufferSize)
                                 val inputStream = socket.getInputStream()
+                                
+                                // Create a separate buffer for amplified audio
+                                val amplifiedBuffer = ByteArray(bufferSize)
 
                                 while (!socket.isClosed && socket.isConnected) {
                                     val bytesRead = inputStream.read(buffer)
                                     if (bytesRead == -1) break
-                                    pttAudioTrack?.write(buffer, 0, bytesRead)
                                     
-                                    // Broadcast PTT audio to all OTHER guardians (feedback)
-                                    synchronized(clientSockets) {
-                                        clientSockets.forEach { guardianSocket ->
-                                            if (guardianSocket != socket && !guardianSocket.isClosed && guardianSocket.isConnected) {
-                                                try {
-                                                    guardianSocket.getOutputStream().write(buffer, 0, bytesRead)
-                                                    guardianSocket.getOutputStream().flush()
-                                                } catch (e: Exception) {
-                                                    Log.e(TAG, "Failed to send PTT feedback to guardian: ${e.message}")
+                                    // Amplify PTT audio before playback
+                                    System.arraycopy(buffer, 0, amplifiedBuffer, 0, bytesRead)
+                                    amplifyAudio(amplifiedBuffer, bytesRead, 4.0f)
+                                    
+                                    // Write amplified audio to ward's speaker
+                                    pttAudioTrack?.write(amplifiedBuffer, 0, bytesRead)
+                                    
+                                    // Broadcast PTT audio to all OTHER guardians (feedback) in a separate thread to prevent blocking
+                                    thread {
+                                        val feedbackBuffer = ByteArray(bytesRead)
+                                        System.arraycopy(buffer, 0, feedbackBuffer, 0, bytesRead)
+                                        
+                                        synchronized(clientSockets) {
+                                            val snapshot = clientSockets.toList()
+                                            snapshot.forEach { guardianSocket ->
+                                                if (guardianSocket != socket && !guardianSocket.isClosed && guardianSocket.isConnected) {
+                                                    try {
+                                                        guardianSocket.getOutputStream().write(feedbackBuffer, 0, bytesRead)
+                                                        guardianSocket.getOutputStream().flush()
+                                                    } catch (e: Exception) {
+                                                        Log.e(TAG, "Failed to send PTT feedback to guardian: ${e.message}")
+                                                    }
                                                 }
                                             }
                                         }
@@ -603,7 +627,7 @@ class MainActivity : ComponentActivity() {
         startPttServer()
 
         // Start server socket for audio streaming
-        thread {
+        serverAcceptThread = thread {
             try {
                 serverSocket = ServerSocket(AUDIO_PORT)
                 Log.d(TAG, "Server socket started on port $AUDIO_PORT")
@@ -635,13 +659,24 @@ class MainActivity : ComponentActivity() {
                 nsdManager?.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registrationListener)
 
                 // Wait for Guardian to connect
-                while (serverSocket != null && !serverSocket!!.isClosed) {
+                while (serverSocket != null && !serverSocket!!.isClosed && isStreaming) {
                     // Update notification based on guardian count and network state
                     runOnUiThread {
                         updateWardNotification()
                     }
                     
-                    val client = serverSocket?.accept()
+                    val client = try {
+                        serverSocket?.accept()
+                    } catch (e: Exception) {
+                        // Network error - socket might be closed or network disconnected
+                        if (isStreaming && !serverSocket!!.isClosed) {
+                            Log.w(TAG, "Server accept error (network issue?): ${e.message}")
+                            // Wait a bit and continue if still streaming
+                            Thread.sleep(1000)
+                        }
+                        null
+                    }
+                    
                     client?.let { socket ->
                         val guardianIp = socket.inetAddress.hostAddress ?: "Unknown"
                         Log.d(TAG, "Guardian connected from $guardianIp")
@@ -709,7 +744,12 @@ class MainActivity : ComponentActivity() {
                                 }
 
                                 // Monitor this socket for disconnection
-                                monitorConnection(socket, guardianName)
+                                val monitorThread = thread {
+                                    monitorConnection(socket, guardianName)
+                                }
+                                synchronized(monitorConnectionThreads) {
+                                    monitorConnectionThreads.add(monitorThread)
+                                }
                             } catch (e: Exception) {
                                 Log.e(TAG, "Error handling guardian connection: ${e.message}")
                                 runOnUiThread {
@@ -722,6 +762,152 @@ class MainActivity : ComponentActivity() {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Server error: ${e.message}")
+                // If we're still supposed to be streaming and network is available, try to restart
+                if (isStreaming && isNetworkAvailable.value) {
+                    Log.d(TAG, "Server socket error but still streaming, will restart on network callback")
+                }
+            } finally {
+                serverAcceptThread = null
+            }
+        }
+    }
+    
+    private fun restartWardServerSocket() {
+        // Only restart if we're still in ward mode
+        if (!isStreaming) {
+            Log.d(TAG, "Not restarting server socket - not in ward mode")
+            return
+        }
+        
+        // Close old socket if it exists
+        try {
+            serverSocket?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error closing old server socket: ${e.message}")
+        }
+        serverSocket = null
+        
+        // Wait for old thread to finish
+        serverAcceptThread?.join(1000)
+        serverAcceptThread = null
+        
+        // Restart the accept loop
+        serverAcceptThread = thread {
+            try {
+                serverSocket = ServerSocket(AUDIO_PORT)
+                Log.d(TAG, "Server socket restarted on port $AUDIO_PORT after network reconnect")
+                
+                // Wait for Guardian to connect
+                while (serverSocket != null && !serverSocket!!.isClosed && isStreaming) {
+                    // Update notification based on guardian count and network state
+                    runOnUiThread {
+                        updateWardNotification()
+                    }
+                    
+                    val client = try {
+                        serverSocket?.accept()
+                    } catch (e: Exception) {
+                        // Network error - socket might be closed or network disconnected
+                        if (isStreaming && serverSocket != null && !serverSocket!!.isClosed) {
+                            Log.w(TAG, "Server accept error (network issue?): ${e.message}")
+                            // Wait a bit and continue if still streaming
+                            Thread.sleep(1000)
+                        }
+                        null
+                    }
+                    
+                    client?.let { socket ->
+                        val guardianIp = socket.inetAddress.hostAddress ?: "Unknown"
+                        Log.d(TAG, "Guardian connected from $guardianIp")
+
+                        // Read device name from guardian
+                        thread {
+                            try {
+                                val inputStream = socket.getInputStream()
+                                val nameBytes = ByteArray(256)
+                                val nameLength = inputStream.read(nameBytes)
+                                val guardianName = if (nameLength > 0) {
+                                    String(nameBytes, 0, nameLength).trim()
+                                } else {
+                                    guardianIp
+                                }
+
+                                // First, check for and remove any stale guardians with the same IP
+                                val staleSockets = mutableListOf<Socket>()
+                                synchronized(clientSockets) {
+                                    // Find all sockets with same IP
+                                    clientSockets.filter { s ->
+                                        try {
+                                            s.inetAddress?.hostAddress == guardianIp && s != socket
+                                        } catch (_: Exception) { false }
+                                    }.forEach { staleSockets.add(it) }
+                                    
+                                    // Remove stale sockets from client list
+                                    staleSockets.forEach { staleSocket ->
+                                        clientSockets.remove(staleSocket)
+                                        try {
+                                            if (!staleSocket.isClosed) {
+                                                staleSocket.shutdownInput()
+                                                staleSocket.shutdownOutput()
+                                                staleSocket.close()
+                                            }
+                                        } catch (_: Exception) {}
+                                    }
+                                }
+                                
+                                // Remove stale guardian entries from UI
+                                runOnUiThread {
+                                    connectedGuardians.removeAll { it.ipAddress == guardianIp }
+                                }
+                                
+                                // Also remove from PTT active set
+                                synchronized(pttActiveSockets) {
+                                    staleSockets.forEach { staleSocket ->
+                                        pttActiveSockets.remove(staleSocket)
+                                    }
+                                }
+
+                                // Add new guardian connection
+                                runOnUiThread {
+                                    connectedGuardians.add(
+                                        GuardianConnection(
+                                            deviceName = guardianName,
+                                            ipAddress = guardianIp,
+                                            socket = socket
+                                        )
+                                    )
+                                }
+                                
+                                synchronized(clientSockets) {
+                                    clientSockets.add(socket)
+                                }
+
+                                // Start audio capture only if not already streaming
+                                if (!isStreaming) {
+                                    startAudioCapture()
+                                }
+
+                                // Monitor this socket for disconnection
+                                val monitorThread = thread {
+                                    monitorConnection(socket, guardianName)
+                                }
+                                synchronized(monitorConnectionThreads) {
+                                    monitorConnectionThreads.add(monitorThread)
+                                }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Error handling guardian connection: ${e.message}")
+                                runOnUiThread {
+                                    connectedGuardians.removeAll { it.socket == socket }
+                                    clientSockets.remove(socket)
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Server restart error: ${e.message}")
+            } finally {
+                serverAcceptThread = null
             }
         }
     }
@@ -772,7 +958,7 @@ class MainActivity : ComponentActivity() {
                 }
                 val bufferSize = minBuffer * 2 // Larger buffer for better quality
                 audioRecord = AudioRecord(
-                    MediaRecorder.AudioSource.MIC,  // Changed from VOICE_COMMUNICATION -> MIC for better compatibility
+                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,  // Optimized for phone call quality with noise suppression and echo cancellation
                     SAMPLE_RATE,
                     CHANNEL_CONFIG_IN,
                     AUDIO_FORMAT,
@@ -808,8 +994,8 @@ class MainActivity : ComponentActivity() {
                 while (isStreaming) {
                     val bytesRead = audioRecord?.read(buffer, 0, bufferSize) ?: 0
                     if (bytesRead > 0) {
-                        // Amplify audio before sending
-                        amplifyAudio(buffer, bytesRead, 3.5f)
+                        // Amplify audio before sending (increased gain for better pickup)
+                        amplifyAudio(buffer, bytesRead, 5.0f)
 
                         // Broadcast to all connected guardians, but skip those sending PTT
                         val toRemove = mutableListOf<Socket>()
@@ -872,16 +1058,15 @@ class MainActivity : ComponentActivity() {
     private fun monitorConnection(socket: Socket, guardianName: String) {
         val guardianIp = try { socket.inetAddress?.hostAddress } catch (_: Exception) { null }
         
-        thread {
-            var lastSuccessfulRead = System.currentTimeMillis()
-            
-            try {
-                val inputStream = socket.getInputStream()
-                val buffer = ByteArray(1)
-                socket.soTimeout = 5000 // 5 second timeout
+        var lastSuccessfulRead = System.currentTimeMillis()
+        
+        try {
+            val inputStream = socket.getInputStream()
+            val buffer = ByteArray(1)
+            socket.soTimeout = 5000 // 5 second timeout
 
-                // Continuously monitor the socket
-                while (!socket.isClosed && socket.isConnected && !Thread.currentThread().isInterrupted && isStreaming) {
+            // Continuously monitor the socket
+            while (!socket.isClosed && socket.isConnected && !Thread.currentThread().isInterrupted && isStreaming) {
                     // Try to read 1 byte with timeout to detect disconnection
                     try {
                         val read = inputStream.read(buffer, 0, 1)
@@ -910,15 +1095,20 @@ class MainActivity : ComponentActivity() {
                         break
                     }
                 }
-            } catch (e: Exception) {
-                Log.d(TAG, "Connection monitoring ended for $guardianName: ${e.message}")
-            } finally {
-                // Clean up this connection - use IP address for more reliable matching
-                Log.d(TAG, "Cleaning up guardian $guardianName (IP: $guardianIp)")
-                
-                synchronized(clientSockets) {
-                    clientSockets.remove(socket)
-                }
+        } catch (e: Exception) {
+            Log.d(TAG, "Connection monitoring ended for $guardianName: ${e.message}")
+        } finally {
+            // Remove this thread from tracking
+            synchronized(monitorConnectionThreads) {
+                monitorConnectionThreads.remove(Thread.currentThread())
+            }
+            
+            // Clean up this connection - use IP address for more reliable matching
+            Log.d(TAG, "Cleaning up guardian $guardianName (IP: $guardianIp)")
+            
+            synchronized(clientSockets) {
+                clientSockets.remove(socket)
+            }
                 synchronized(pttActiveSockets) {
                     pttActiveSockets.remove(socket)
                 }
@@ -949,6 +1139,28 @@ class MainActivity : ComponentActivity() {
         
         Log.d(TAG, "Stopping audio broadcast...")
         isStreaming = false
+        
+        // Wait for all monitor threads to finish (with timeout)
+        synchronized(monitorConnectionThreads) {
+            monitorConnectionThreads.forEach { thread ->
+                try {
+                    thread.join(500) // Wait up to 500ms per thread
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error waiting for monitor thread: ${e.message}")
+                }
+            }
+            monitorConnectionThreads.clear()
+        }
+        
+        // Wait for server accept thread to finish
+        serverAcceptThread?.let { thread ->
+            try {
+                thread.join(1000) // Wait up to 1 second
+            } catch (e: Exception) {
+                Log.w(TAG, "Error waiting for server accept thread: ${e.message}")
+            }
+        }
+        serverAcceptThread = null
 
         // Close server sockets first to stop accepting new connections
         try {
@@ -1230,6 +1442,7 @@ class MainActivity : ComponentActivity() {
         connectionMonitorThread = thread {
             var alertShown = false
             var statusUpdatedToDisconnected = false
+            var lastStatusCheck = System.currentTimeMillis()
             
             try {
                 while (isMonitoringConnection) {
@@ -1252,25 +1465,33 @@ class MainActivity : ComponentActivity() {
                         
                         Thread.sleep(1000)
                         val timeSinceLastData = System.currentTimeMillis() - lastConnectionTime
-
-                        // Update status immediately if no data received for more than 3 seconds
-                        // (indicates ward is likely disconnected)
-                        if (timeSinceLastData > 3000 && !statusUpdatedToDisconnected) {
-                            Log.d(TAG, "No data received for ${timeSinceLastData}ms, marking as disconnected")
-                            statusUpdatedToDisconnected = true
-                            runOnUiThread {
-                                isConnectedToWard.value = false
+                        val timeSinceLastCheck = System.currentTimeMillis() - lastStatusCheck
+                        
+                        // Only update status if we've waited at least 2 seconds since last check to prevent flickering
+                        if (timeSinceLastCheck >= 2000) {
+                            lastStatusCheck = System.currentTimeMillis()
+                            
+                            // Update status if no data received for more than 3 seconds
+                            if (timeSinceLastData > 3000) {
+                                if (!statusUpdatedToDisconnected) {
+                                    Log.d(TAG, "No data received for ${timeSinceLastData}ms, marking as disconnected")
+                                    statusUpdatedToDisconnected = true
+                                    runOnUiThread {
+                                        isConnectedToWard.value = false
+                                    }
+                                }
+                            } else {
+                                // We're receiving data - only set connected if we were previously disconnected
+                                // This prevents flickering when data arrives intermittently
+                                if (statusUpdatedToDisconnected && timeSinceLastData < 2000) {
+                                    statusUpdatedToDisconnected = false
+                                    runOnUiThread {
+                                        isConnectedToWard.value = true
+                                    }
+                                }
                             }
                         }
                         
-                        // Reset status if we start receiving data again
-                        if (timeSinceLastData < 2000 && statusUpdatedToDisconnected && !alertShown) {
-                            statusUpdatedToDisconnected = false
-                            runOnUiThread {
-                                isConnectedToWard.value = true
-                            }
-                        }
-
                         // Show alert after full timeout
                         if (timeSinceLastData > CONNECTION_TIMEOUT_MS && !alertShown) {
                             alertShown = true
