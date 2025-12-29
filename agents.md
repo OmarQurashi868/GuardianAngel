@@ -284,6 +284,7 @@ Add analytics or logs
 - Fixed ward exit crash by ensuring all monitorConnection threads and server accept thread are properly tracked and waited for before cleanup.
 - When ward loses network connection and reconnects, the server socket accept loop automatically restarts, allowing previously connected guardians to reconnect without requiring the ward to stop and restart its session.
 - Server socket accept loop handles network errors gracefully and restarts when network becomes available again (detected via ConnectivityManager.NetworkCallback).
+- Fixed guardian connection establishment issue: improved error handling and logging for device name reading, added socket timeout for name reading, ensured socket is added to clientSockets before UI update to prevent race conditions, and added comprehensive logging to track connection flow.
 
 ### Audio quality improvements
 - Ward audio capture now uses `VOICE_COMMUNICATION` audio source instead of `MIC` for phone call quality with built-in noise suppression and echo cancellation.

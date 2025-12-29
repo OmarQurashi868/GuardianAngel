@@ -685,13 +685,29 @@ class MainActivity : ComponentActivity() {
                         thread {
                             try {
                                 val inputStream = socket.getInputStream()
+                                // Set a timeout for reading the device name
+                                socket.soTimeout = 5000
                                 val nameBytes = ByteArray(256)
-                                val nameLength = inputStream.read(nameBytes)
-                                val guardianName = if (nameLength > 0) {
-                                    String(nameBytes, 0, nameLength).trim()
-                                } else {
-                                    guardianIp
+                                val nameLength = try {
+                                    inputStream.read(nameBytes)
+                                } catch (e: java.net.SocketTimeoutException) {
+                                    Log.e(TAG, "Timeout reading device name from guardian $guardianIp")
+                                    socket.close()
+                                    return@thread
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "Error reading device name: ${e.message}")
+                                    socket.close()
+                                    return@thread
                                 }
+                                
+                                if (nameLength <= 0) {
+                                    Log.e(TAG, "Invalid device name length: $nameLength")
+                                    socket.close()
+                                    return@thread
+                                }
+                                
+                                val guardianName = String(nameBytes, 0, nameLength).trim()
+                                Log.d(TAG, "Received device name from guardian: $guardianName (IP: $guardianIp)")
 
                                 // First, check for and remove any stale guardians with the same IP
                                 val staleSockets = mutableListOf<Socket>()
@@ -726,7 +742,12 @@ class MainActivity : ComponentActivity() {
                                     staleSockets.forEach { pttActiveSockets.remove(it) }
                                 }
                                 
-                                // Now add the new connection
+                                // Add socket to client list BEFORE adding to UI to ensure it's available for audio broadcasting
+                                synchronized(clientSockets) {
+                                    clientSockets.add(socket)
+                                }
+                                
+                                // Now add the new connection to UI
                                 val connection = GuardianConnection(guardianName, guardianIp, socket)
                                 runOnUiThread {
                                     connectedGuardians.add(connection)
@@ -734,13 +755,14 @@ class MainActivity : ComponentActivity() {
                                     updateWardNotification()
                                 }
                                 
-                                synchronized(clientSockets) {
-                                    clientSockets.add(socket)
-                                }
+                                Log.d(TAG, "Guardian $guardianName added to connected list, socket added to client list")
 
                                 // Start audio capture only if not already streaming
                                 if (!isStreaming) {
+                                    Log.d(TAG, "Starting audio capture for guardian $guardianName")
                                     startAudioCapture()
+                                } else {
+                                    Log.d(TAG, "Audio capture already running, guardian $guardianName will receive audio")
                                 }
 
                                 // Monitor this socket for disconnection
@@ -750,11 +772,18 @@ class MainActivity : ComponentActivity() {
                                 synchronized(monitorConnectionThreads) {
                                     monitorConnectionThreads.add(monitorThread)
                                 }
+                                
+                                Log.d(TAG, "Guardian $guardianName connection fully established")
                             } catch (e: Exception) {
-                                Log.e(TAG, "Error handling guardian connection: ${e.message}")
-                                runOnUiThread {
-                                    connectedGuardians.removeAll { it.socket == socket }
+                                Log.e(TAG, "Error handling guardian connection: ${e.message}", e)
+                                try {
+                                    socket.close()
+                                } catch (_: Exception) {}
+                                synchronized(clientSockets) {
                                     clientSockets.remove(socket)
+                                }
+                                runOnUiThread {
+                                    connectedGuardians.removeAll { it.socket == socket || it.ipAddress == guardianIp }
                                 }
                             }
                         }
@@ -818,19 +847,35 @@ class MainActivity : ComponentActivity() {
                     
                     client?.let { socket ->
                         val guardianIp = socket.inetAddress.hostAddress ?: "Unknown"
-                        Log.d(TAG, "Guardian connected from $guardianIp")
+                        Log.d(TAG, "Guardian connected from $guardianIp (restart)")
 
                         // Read device name from guardian
                         thread {
                             try {
                                 val inputStream = socket.getInputStream()
+                                // Set a timeout for reading the device name
+                                socket.soTimeout = 5000
                                 val nameBytes = ByteArray(256)
-                                val nameLength = inputStream.read(nameBytes)
-                                val guardianName = if (nameLength > 0) {
-                                    String(nameBytes, 0, nameLength).trim()
-                                } else {
-                                    guardianIp
+                                val nameLength = try {
+                                    inputStream.read(nameBytes)
+                                } catch (e: java.net.SocketTimeoutException) {
+                                    Log.e(TAG, "Timeout reading device name from guardian $guardianIp (restart)")
+                                    socket.close()
+                                    return@thread
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "Error reading device name (restart): ${e.message}")
+                                    socket.close()
+                                    return@thread
                                 }
+                                
+                                if (nameLength <= 0) {
+                                    Log.e(TAG, "Invalid device name length (restart): $nameLength")
+                                    socket.close()
+                                    return@thread
+                                }
+                                
+                                val guardianName = String(nameBytes, 0, nameLength).trim()
+                                Log.d(TAG, "Received device name from guardian (restart): $guardianName (IP: $guardianIp)")
 
                                 // First, check for and remove any stale guardians with the same IP
                                 val staleSockets = mutableListOf<Socket>()
@@ -867,7 +912,12 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
 
-                                // Add new guardian connection
+                                // Add socket to client list BEFORE adding to UI to ensure it's available for audio broadcasting
+                                synchronized(clientSockets) {
+                                    clientSockets.add(socket)
+                                }
+
+                                // Add new guardian connection to UI
                                 runOnUiThread {
                                     connectedGuardians.add(
                                         GuardianConnection(
@@ -876,15 +926,17 @@ class MainActivity : ComponentActivity() {
                                             socket = socket
                                         )
                                     )
+                                    updateWardNotification()
                                 }
                                 
-                                synchronized(clientSockets) {
-                                    clientSockets.add(socket)
-                                }
+                                Log.d(TAG, "Guardian $guardianName added to connected list (restart), socket added to client list")
 
                                 // Start audio capture only if not already streaming
                                 if (!isStreaming) {
+                                    Log.d(TAG, "Starting audio capture for guardian $guardianName (restart)")
                                     startAudioCapture()
+                                } else {
+                                    Log.d(TAG, "Audio capture already running, guardian $guardianName will receive audio (restart)")
                                 }
 
                                 // Monitor this socket for disconnection
@@ -894,11 +946,18 @@ class MainActivity : ComponentActivity() {
                                 synchronized(monitorConnectionThreads) {
                                     monitorConnectionThreads.add(monitorThread)
                                 }
+                                
+                                Log.d(TAG, "Guardian $guardianName connection fully established (restart)")
                             } catch (e: Exception) {
-                                Log.e(TAG, "Error handling guardian connection: ${e.message}")
-                                runOnUiThread {
-                                    connectedGuardians.removeAll { it.socket == socket }
+                                Log.e(TAG, "Error handling guardian connection (restart): ${e.message}", e)
+                                try {
+                                    socket.close()
+                                } catch (_: Exception) {}
+                                synchronized(clientSockets) {
                                     clientSockets.remove(socket)
+                                }
+                                runOnUiThread {
+                                    connectedGuardians.removeAll { it.socket == socket || it.ipAddress == guardianIp }
                                 }
                             }
                         }
